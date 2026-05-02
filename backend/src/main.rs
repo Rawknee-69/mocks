@@ -3,8 +3,6 @@ mod core;
 mod error;
 mod handlers;
 mod logger;
-mod platform;
-mod screenshot;
 mod server;
 
 use dotenvy::dotenv;

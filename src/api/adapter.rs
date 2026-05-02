@@ -7,7 +7,6 @@
 /// Auto-reconnect: if the connection drops the background task tries to reconnect
 /// with an exponential back-off (up to 5 seconds between attempts).
 use crate::audio::UiEvent;
-use crate::core::coordinate_mapper::DisplayInfo;
 use clicky_types::{ClientMessage, ErrorCode, ServerMessage};
 use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc as async_mpsc;
@@ -168,25 +167,10 @@ fn server_message_to_ui_event(msg: ServerMessage) -> Option<UiEvent> {
         }
 
         ServerMessage::LlmResponse { spoken_text, coordinate, display_infos } => {
-            // Convert clicky_types::DisplayInfo → core::coordinate_mapper::DisplayInfo
-            let frontend_display_infos: Vec<DisplayInfo> = display_infos
-                .into_iter()
-                .map(|d| DisplayInfo {
-                    screen_number: d.screen_number,
-                    global_origin_x: d.global_origin_x,
-                    global_origin_y: d.global_origin_y,
-                    display_width_points: d.display_width_points,
-                    display_height_points: d.display_height_points,
-                    screenshot_width_pixels: d.screenshot_width_pixels,
-                    screenshot_height_pixels: d.screenshot_height_pixels,
-                    is_cursor_display: d.is_cursor_display,
-                })
-                .collect();
-
             Some(UiEvent::LlmResponse {
                 spoken_text,
-                pointing_instruction: None, // backend resolves coords; no POINT tag needed here
-                display_infos: frontend_display_infos,
+                pointing_instruction: None,
+                display_infos,
                 computer_use_global_coordinate: coordinate,
             })
         }

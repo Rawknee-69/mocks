@@ -45,10 +45,8 @@ examples:
 - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]""#;
 
 /// A screenshot to send to Claude for vision analysis.
-pub struct ScreenshotForClaude {
-    pub jpeg_data: Vec<u8>,
-    pub label: String,
-}
+/// Re-exported from the shared types crate for use in backend API modules.
+pub use clicky_types::ScreenshotData;
 
 /// Streams a Claude response for the given messages and collects the full text.
 ///
@@ -131,7 +129,7 @@ pub async fn stream_claude_response(
 /// Builds the `content` array for a Claude message that includes screenshots and a transcript.
 pub fn build_vision_message_content(
     user_transcript: &str,
-    screenshots: &[ScreenshotForClaude],
+    screenshots: &[ScreenshotData],
 ) -> serde_json::Value {
     let mut content_blocks: Vec<serde_json::Value> = Vec::new();
 

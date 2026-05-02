@@ -7,8 +7,7 @@
 /// when they try to send on the closed channel.
 use crate::error::AppError;
 use crate::handlers::{llm_pipeline, transcription};
-use crate::platform;
-use clicky_types::{ClientMessage, ServerMessage};
+use clicky_types::{ClientMessage, DisplayInfo, ScreenshotData, ServerMessage};
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
@@ -62,15 +61,14 @@ async fn handle_connection(tcp_stream: TcpStream) {
     let elevenlabs_voice = std::env::var("ELEVENLABS_VOICE_ID").ok();
     let tts_enabled = elevenlabs_key.is_some();
 
-    let platform = platform::detect();
     let http_client = reqwest::Client::new();
 
-    // Mutable pipeline state owned by the WS receive loop
     let mut active_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
     let mut audio_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>> = None;
     let mut conversation_history: Vec<(String, String)> = Vec::new();
     let mut last_transcript: Option<String> = None;
     let mut cursor_position: (f32, f32) = (0.0, 0.0);
+    let mut pending_screenshots: Option<(Vec<ScreenshotData>, Vec<DisplayInfo>)> = None;
 
     // Internal channel: pipeline tasks send ServerMessages here; this loop also
     // intercepts FinalTranscript to trigger the LLM pipeline.
@@ -115,6 +113,7 @@ async fn handle_connection(tcp_stream: TcpStream) {
                     &mut active_cancel,
                     &mut audio_tx,
                     &mut cursor_position,
+                    &mut pending_screenshots,
                     &assemblyai_key,
                     pipeline_tx.clone(),
                     &server_tx,
@@ -149,11 +148,12 @@ async fn handle_connection(tcp_stream: TcpStream) {
                             };
                             let client = http_client.clone();
                             let tx = pipeline_tx.clone();
-                            let plat = platform.clone();
                             let history = conversation_history.clone();
-                            let cursor = cursor_position;
+                            let (screenshots, display_infos) = pending_screenshots
+                                .take()
+                                .unwrap_or_default();
                             tokio::spawn(llm_pipeline::run_llm_pipeline(
-                                client, config, transcript, cursor, history, plat, tx,
+                                client, config, transcript, screenshots, display_infos, history, tx,
                             ));
                         }
                     }
@@ -187,6 +187,7 @@ async fn handle_client_message(
     active_cancel: &mut Option<tokio::sync::oneshot::Sender<()>>,
     audio_tx: &mut Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     cursor_position: &mut (f32, f32),
+    pending_screenshots: &mut Option<(Vec<ScreenshotData>, Vec<DisplayInfo>)>,
     assemblyai_key: &Option<String>,
     pipeline_tx: mpsc::Sender<ServerMessage>,
     server_tx: &mpsc::Sender<ServerMessage>,
@@ -195,7 +196,6 @@ async fn handle_client_message(
         ClientMessage::HotkeyPressed => {
             info!("hotkey pressed");
 
-            // Cancel any running pipeline
             if let Some(cancel) = active_cancel.take() {
                 let _ = cancel.send(());
             }
@@ -211,7 +211,6 @@ async fn handle_client_message(
             let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
             *active_cancel = Some(cancel_tx);
 
-            // Bounded sync channel for audio chunks
             let (audio_std_tx, audio_std_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(128);
             *audio_tx = Some(audio_std_tx);
 
@@ -225,14 +224,12 @@ async fn handle_client_message(
 
         ClientMessage::AudioChunk { pcm16_bytes } => {
             if let Some(tx) = audio_tx.as_ref() {
-                // try_send: drop chunk rather than block the WS receive loop
                 let _ = tx.try_send(pcm16_bytes);
             }
         }
 
         ClientMessage::HotkeyReleased => {
             info!("hotkey released — waiting for final transcript");
-            // Dropping audio_tx closes the std channel → transcription task drains and finalises
             *audio_tx = None;
             if let Some(cancel) = active_cancel.take() {
                 let _ = cancel.send(());
@@ -249,6 +246,11 @@ async fn handle_client_message(
 
         ClientMessage::CursorPosition { x, y } => {
             *cursor_position = (x, y);
+        }
+
+        ClientMessage::Screenshots { screenshots, display_infos } => {
+            info!("received {} screenshots from frontend", screenshots.len());
+            *pending_screenshots = Some((screenshots, display_infos));
         }
     }
 }

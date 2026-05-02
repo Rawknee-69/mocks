@@ -1,4 +1,4 @@
-use clicky_types::DisplayInfo;
+pub use clicky_types::DisplayInfo;
 
 /// A coordinate in the global (virtual desktop) coordinate system.
 #[derive(Debug, Clone, Copy)]
@@ -18,11 +18,11 @@ pub fn map_screenshot_pixels_to_global(
     screenshot_pixel_y: f64,
     display: &DisplayInfo,
 ) -> GlobalDisplayCoordinate {
-    let clamped_x = screenshot_pixel_x.clamp(0.0, display.screenshot_width_pixels as f64 - 1.0);
-    let clamped_y = screenshot_pixel_y.clamp(0.0, display.screenshot_height_pixels as f64 - 1.0);
+    let clamped_x = screenshot_pixel_x.clamp(0.0, f64::from(display.screenshot_width_pixels) - 1.0);
+    let clamped_y = screenshot_pixel_y.clamp(0.0, f64::from(display.screenshot_height_pixels) - 1.0);
 
-    let scale_x = display.display_width_points / display.screenshot_width_pixels as f64;
-    let scale_y = display.display_height_points / display.screenshot_height_pixels as f64;
+    let scale_x = display.display_width_points / f64::from(display.screenshot_width_pixels);
+    let scale_y = display.display_height_points / f64::from(display.screenshot_height_pixels);
 
     GlobalDisplayCoordinate {
         x: display.global_origin_x + clamped_x * scale_x,

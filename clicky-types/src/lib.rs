@@ -25,6 +25,20 @@ pub enum ClientMessage {
     /// Current global mouse cursor position, sent each frame (or on change).
     /// The backend uses this for screenshot cursor detection and Computer Use targeting.
     CursorPosition { x: f32, y: f32 },
+
+    /// Screenshots captured by the frontend after hotkey release.
+    /// The backend uses these for the Claude vision + Computer Use pipeline.
+    Screenshots {
+        screenshots: Vec<ScreenshotData>,
+        display_infos: Vec<DisplayInfo>,
+    },
+}
+
+/// A captured screenshot to send to the backend for LLM processing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenshotData {
+    pub jpeg_data: Vec<u8>,
+    pub label: String,
 }
 
 // ─── Backend → Frontend ──────────────────────────────────────────────────────

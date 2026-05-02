@@ -1,13 +1,11 @@
-/// LLM pipeline handler — screenshot + Claude vision + Computer Use + TTS.
+/// LLM pipeline handler — Claude vision + Computer Use + TTS.
 ///
-/// This is the backend equivalent of `src/runtime::run_llm_pipeline`.
+/// Screenshots arrive from the frontend over WebSocket. The backend no longer captures them.
 use crate::api::{claude, computer_use};
 use crate::core::{coordinate_mapper, point_parser};
 use crate::error::AppError;
 use crate::handlers::tts;
-use crate::platform::PlatformInfo;
-use crate::screenshot;
-use clicky_types::ServerMessage;
+use clicky_types::{DisplayInfo, ScreenshotData, ServerMessage};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -20,7 +18,7 @@ pub struct LlmPipelineConfig {
 
 /// Runs the full LLM pipeline for a completed transcript.
 ///
-/// 1. Captures screenshots
+/// 1. Uses screenshots provided by the frontend
 /// 2. Calls Claude vision API (streaming)
 /// 3. Parses POINT tag
 /// 4. Spawns ElevenLabs TTS in parallel with Computer Use
@@ -30,35 +28,21 @@ pub async fn run_llm_pipeline(
     http_client: reqwest::Client,
     config: LlmPipelineConfig,
     transcript: String,
-    cursor_position: (f32, f32),
+    screenshots: Vec<ScreenshotData>,
+    display_infos: Vec<DisplayInfo>,
     history_exchanges: Vec<(String, String)>,
-    platform: PlatformInfo,
     server_tx: mpsc::Sender<ServerMessage>,
 ) {
-    let (cursor_x, cursor_y) = cursor_position;
+    if screenshots.is_empty() {
+        warn!("no screenshots received from frontend, skipping pipeline");
+        let _ = server_tx
+            .send(AppError::Screenshot("no screenshots received from frontend".into()).into_server_message())
+            .await;
+        return;
+    }
 
-    // Capture screenshots on a blocking thread (OS calls)
-    let capture = match tokio::task::spawn_blocking(move || {
-        screenshot::capture_all_screens(cursor_x, cursor_y, &platform)
-    })
-    .await
-    {
-        Ok(Ok(capture)) => capture,
-        Ok(Err(err)) => {
-            error!("screenshot failed: {err}");
-            let _ = server_tx.send(AppError::Screenshot(err.to_string()).into_server_message()).await;
-            return;
-        }
-        Err(err) => {
-            error!("screenshot task panicked: {err}");
-            let _ = server_tx.send(AppError::Internal("screenshot task panicked".into()).into_server_message()).await;
-            return;
-        }
-    };
+    log_debug_screenshots(&screenshots, &display_infos);
 
-    log_debug_screenshots(&capture);
-
-    // Build conversation history messages
     let mut messages: Vec<serde_json::Value> = Vec::new();
     for (user_text, assistant_text) in &history_exchanges {
         messages.push(serde_json::json!({"role": "user", "content": user_text}));
@@ -66,7 +50,7 @@ pub async fn run_llm_pipeline(
     }
 
     let user_content =
-        claude::build_vision_message_content(&transcript, &capture.screenshots);
+        claude::build_vision_message_content(&transcript, &screenshots);
     messages.push(serde_json::json!({"role": "user", "content": user_content}));
 
     let model = claude::DEFAULT_CLAUDE_MODEL;
@@ -78,7 +62,7 @@ pub async fn run_llm_pipeline(
         model,
         claude::COMPANION_VOICE_RESPONSE_SYSTEM_PROMPT,
         messages,
-        |_chunk| {}, // future: forward LlmTextDelta events
+        |_chunk| {},
     )
     .await;
 
@@ -93,7 +77,6 @@ pub async fn run_llm_pipeline(
 
     let parsed = point_parser::parse_claude_response(&response_text);
 
-    // Spawn TTS in parallel with Computer Use (matches original behaviour)
     if config.tts_enabled && !parsed.spoken_text.is_empty() {
         if let Some(ref elevenlabs_api_key) = config.elevenlabs_api_key {
             let tts_client = http_client.clone();
@@ -115,10 +98,10 @@ pub async fn run_llm_pipeline(
         }
     }
 
-    // Determine global coordinate — prefer Computer Use over POINT tag
     let computer_use_coordinate = detect_computer_use_coordinate(
         &http_client,
-        &capture,
+        &screenshots,
+        &display_infos,
         &config.anthropic_api_key,
         &transcript,
     )
@@ -127,8 +110,7 @@ pub async fn run_llm_pipeline(
     let final_coordinate = if let Some(coord) = computer_use_coordinate {
         Some(coord)
     } else if let Some(ref pointing) = parsed.pointing {
-        // Fall back to POINT tag coordinate mapping
-        coordinate_mapper::find_target_display(pointing.screen_number, &capture.display_infos)
+        coordinate_mapper::find_target_display(pointing.screen_number, &display_infos)
             .map(|display| {
                 let global = coordinate_mapper::map_screenshot_pixels_to_global(
                     pointing.screenshot_pixel_x,
@@ -145,22 +127,22 @@ pub async fn run_llm_pipeline(
         .send(ServerMessage::LlmResponse {
             spoken_text: parsed.spoken_text,
             coordinate: final_coordinate,
-            display_infos: capture.display_infos,
+            display_infos,
         })
         .await;
 }
 
 async fn detect_computer_use_coordinate(
     http_client: &reqwest::Client,
-    capture: &screenshot::CaptureResult,
+    screenshots: &[ScreenshotData],
+    display_infos: &[DisplayInfo],
     anthropic_api_key: &str,
     transcript: &str,
 ) -> Option<(f64, f64)> {
-    let cursor_display = capture.display_infos.iter().find(|d| d.is_cursor_display)?;
-    let cursor_screenshot = capture
-        .screenshots
+    let cursor_display = display_infos.iter().find(|d| d.is_cursor_display)?;
+    let cursor_screenshot = screenshots
         .iter()
-        .zip(capture.display_infos.iter())
+        .zip(display_infos.iter())
         .find(|(_, d)| d.is_cursor_display)
         .map(|(s, _)| s)?;
 
@@ -183,8 +165,8 @@ async fn detect_computer_use_coordinate(
 }
 
 #[cfg(debug_assertions)]
-fn log_debug_screenshots(capture: &screenshot::CaptureResult) {
-    for (index, screenshot) in capture.screenshots.iter().enumerate() {
+fn log_debug_screenshots(screenshots: &[ScreenshotData], display_infos: &[DisplayInfo]) {
+    for (index, screenshot) in screenshots.iter().enumerate() {
         let path = if cfg!(target_os = "windows") {
             format!(
                 "{}\\clicky_debug_screenshot_{}.jpg",
@@ -200,7 +182,7 @@ fn log_debug_screenshots(capture: &screenshot::CaptureResult) {
             info!("debug screenshot saved: {path} (label: {})", screenshot.label);
         }
     }
-    for (i, d) in capture.display_infos.iter().enumerate() {
+    for (i, d) in display_infos.iter().enumerate() {
         info!(
             "debug display {i}: origin=({},{}) size={}x{} screenshot={}x{} cursor={}",
             d.global_origin_x, d.global_origin_y,
@@ -212,4 +194,4 @@ fn log_debug_screenshots(capture: &screenshot::CaptureResult) {
 }
 
 #[cfg(not(debug_assertions))]
-fn log_debug_screenshots(_capture: &screenshot::CaptureResult) {}
+fn log_debug_screenshots(_screenshots: &[ScreenshotData], _display_infos: &[DisplayInfo]) {}

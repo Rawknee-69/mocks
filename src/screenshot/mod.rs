@@ -5,9 +5,8 @@
 ///   GNOME Wayland  → xcap portal with animations temporarily disabled (no flash)
 ///   X11            → xcap (XGetImage)
 ///   Fallback       → xcap default
-use crate::api::claude::ScreenshotForClaude;
 use crate::app::platform::{DisplayServer, PlatformInfo, WaylandCompositor};
-use crate::core::coordinate_mapper::DisplayInfo;
+use clicky_types::{DisplayInfo, ScreenshotData};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use std::fmt;
@@ -41,7 +40,7 @@ fn get_windows_virtual_desktop_bounds() -> Option<(i32, i32, i32, i32)> {
 }
 
 pub struct CaptureResult {
-    pub screenshots: Vec<ScreenshotForClaude>,
+    pub screenshots: Vec<ScreenshotData>,
     pub display_infos: Vec<DisplayInfo>,
 }
 
@@ -297,7 +296,7 @@ fn capture_with_grim(cursor_x: f32, cursor_y: f32) -> Result<CaptureResult, Scre
             )
         };
 
-        screenshots.push(ScreenshotForClaude { jpeg_data, label });
+        screenshots.push(ScreenshotData { jpeg_data, label });
         // display_width/height_points = LOGICAL size (what the compositor uses
         // for window positioning). This is what the overlay coordinate space uses.
         // screenshot_width/height_pixels = the JPEG dimensions sent to Claude.
@@ -430,7 +429,7 @@ fn capture_with_xcap(cursor_x: f32, cursor_y: f32) -> Result<CaptureResult, Scre
             )
         };
 
-        screenshots.push(ScreenshotForClaude { jpeg_data, label });
+        screenshots.push(ScreenshotData { jpeg_data, label });
         display_infos.push(DisplayInfo {
             screen_number: screen_num,
             global_origin_x: mon_x as f64,

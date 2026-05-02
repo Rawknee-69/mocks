@@ -9,27 +9,7 @@
 /// origin coordinates, so NO Y-axis flip is needed (macOS AppKit uses
 /// bottom-left origin).
 
-/// Metadata about a captured display, used for coordinate mapping.
-#[derive(Debug, Clone)]
-pub struct DisplayInfo {
-    /// Display index (1-based, matching Claude's screen numbering)
-    pub screen_number: u32,
-
-    /// Origin of this display in global (virtual desktop) coordinates
-    pub global_origin_x: f64,
-    pub global_origin_y: f64,
-
-    /// Display size in logical points (may differ from pixels on HiDPI)
-    pub display_width_points: f64,
-    pub display_height_points: f64,
-
-    /// Screenshot image dimensions in pixels
-    pub screenshot_width_pixels: u32,
-    pub screenshot_height_pixels: u32,
-
-    /// Whether the user's cursor is on this display
-    pub is_cursor_display: bool,
-}
+pub use clicky_types::DisplayInfo;
 
 /// A coordinate in the global (virtual desktop) coordinate system,
 /// ready for positioning the overlay cursor.
@@ -53,20 +33,17 @@ pub fn map_screenshot_pixels_to_global_display_coordinates(
     screenshot_pixel_y: f64,
     display: &DisplayInfo,
 ) -> GlobalDisplayCoordinate {
-    // Step 1: Clamp to screenshot pixel bounds
     let clamped_pixel_x =
-        screenshot_pixel_x.clamp(0.0, display.screenshot_width_pixels as f64 - 1.0);
+        screenshot_pixel_x.clamp(0.0, f64::from(display.screenshot_width_pixels) - 1.0);
     let clamped_pixel_y =
-        screenshot_pixel_y.clamp(0.0, display.screenshot_height_pixels as f64 - 1.0);
+        screenshot_pixel_y.clamp(0.0, f64::from(display.screenshot_height_pixels) - 1.0);
 
-    // Step 2: Scale from screenshot pixels to display points
-    let scale_x = display.display_width_points / display.screenshot_width_pixels as f64;
-    let scale_y = display.display_height_points / display.screenshot_height_pixels as f64;
+    let scale_x = display.display_width_points / f64::from(display.screenshot_width_pixels);
+    let scale_y = display.display_height_points / f64::from(display.screenshot_height_pixels);
 
     let display_local_x = clamped_pixel_x * scale_x;
     let display_local_y = clamped_pixel_y * scale_y;
 
-    // Step 3: Convert to global coordinates by adding display origin
     GlobalDisplayCoordinate {
         x: display.global_origin_x + display_local_x,
         y: display.global_origin_y + display_local_y,
@@ -128,7 +105,7 @@ mod tests {
         display.is_cursor_display = false;
 
         let coord = map_screenshot_pixels_to_global_display_coordinates(0.0, 0.0, &display);
-        assert!((coord.x - 1920.0).abs() < 0.1); // offset by first monitor width
+        assert!((coord.x - 1920.0).abs() < 0.1);
     }
 
     #[test]

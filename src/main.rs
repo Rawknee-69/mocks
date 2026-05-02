@@ -17,7 +17,6 @@ use audio::capture::MicCapture;
 use audio::UiEvent;
 use clicky_types::ClientMessage;
 use core::audio_rms::AudioPowerLevelTracker;
-use core::conversation::ConversationHistory;
 use hotkey::PushToTalkTransition;
 use log::info;
 use overlay::renderer::{self, CursorNavigationMode, OverlayRenderState};
@@ -74,8 +73,6 @@ fn main() {
         panel::run_onboarding_blocking(app_config.clone());
         app_config = config::AppConfig::load();
     }
-
-    let mut conversation_history = ConversationHistory::new();
 
     let mut audio_player = match audio::playback::AudioPlayer::new() {
         Ok(player) => {
@@ -259,7 +256,6 @@ fn main() {
                             }
                             processing_since = Some(Instant::now());
 
-                            // Simulation: send a fake LlmResponse after a short delay
                             let sim_tx = api_adapter.client_tx_clone();
                             let sw = screen_w;
                             let sh = screen_h;
@@ -275,11 +271,32 @@ fn main() {
                                     .subsec_nanos();
                                 let _target_x = margin_x + (rand_seed as f64 % range_x);
                                 let _target_y = margin_y + ((rand_seed / 7) as f64 % range_y);
-                                // simulation mode bypasses the backend; drop the sender
                                 drop(sim_tx);
                             });
                         } else {
                             api_adapter.send(ClientMessage::HotkeyReleased);
+
+                            let cursor_pos = cursor_tracker.get_position();
+                            let platform_clone = platform.clone();
+                            let adapter_tx = api_adapter.client_tx_clone();
+                            tokio_rt.spawn(tokio::task::spawn_blocking(move || {
+                                match screenshot::capture_all_screens(
+                                    cursor_pos.0,
+                                    cursor_pos.1,
+                                    &platform_clone,
+                                ) {
+                                    Ok(capture) => {
+                                        let _ = adapter_tx.send(ClientMessage::Screenshots {
+                                            screenshots: capture.screenshots,
+                                            display_infos: capture.display_infos,
+                                        });
+                                    }
+                                    Err(err) => {
+                                        log::error!("Screenshot capture failed: {}", err);
+                                    }
+                                }
+                            }));
+
                             if let Some(new_state) =
                                 voice_state.apply(VoiceStateTransition::HotkeyReleased)
                             {
@@ -363,10 +380,6 @@ fn main() {
                     }
 
                     info!("LLM response: {}", spoken_text);
-
-                    if let Some(ref transcript) = last_transcript {
-                        conversation_history.add_exchange(transcript.clone(), spoken_text.clone());
-                    }
 
                     if let Some(new_state) = voice_state.apply(VoiceStateTransition::ResponseReady) {
                         voice_state = new_state;
