@@ -15,8 +15,14 @@ pub fn query_refresh_hz() -> u32 {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        // On Linux, refresh rate could be read via xrandr or DRM, but that requires
-        // additional dependencies. 60 Hz is a safe default for now.
         60
     }
+}
+
+/// Block until the next display vsync boundary.
+/// Call this at the START of each frame iteration, before sampling the cursor.
+/// On Windows: DwmFlush(). On other platforms: no-op (frame budget sleep handles pacing).
+pub fn sync_to_display() {
+    #[cfg(target_os = "windows")]
+    windows::sync_to_display();
 }

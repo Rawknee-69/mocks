@@ -17,7 +17,6 @@ use tiny_skia::Pixmap;
 use winit::window::Window;
 
 use windows_sys::Win32::Foundation::{HWND, POINT, SIZE};
-use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, DIB_RGB_COLORS,
@@ -26,6 +25,14 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 
 use crate::overlay::renderer::OverlayRenderState;
+
+/// Timing breakdown for one rendered frame (milliseconds).
+#[derive(Default, Clone, Copy)]
+pub struct RenderTimings {
+    pub paint_ms:   f32,   // tiny-skia draw calls
+    pub copy_ms:    f32,   // RGBA -> BGRA memcpy
+    pub present_ms: f32,   // UpdateLayeredWindow
+}
 
 pub struct Renderer {
     hwnd: HWND,
@@ -85,7 +92,9 @@ impl Renderer {
         render_state: &OverlayRenderState,
         font_system: &mut FontSystem,
         elapsed_secs: f64,
-    ) {
+    ) -> RenderTimings {
+        let t_paint_start = std::time::Instant::now();
+
         crate::overlay::paint::draw_overlay_frame(
             &mut self.pixmap,
             render_state,
@@ -93,6 +102,8 @@ impl Renderer {
             &mut self.swash_cache,
             elapsed_secs,
         );
+
+        let t_copy_start = std::time::Instant::now();
 
         // Copy RGBA premultiplied (tiny-skia) -> BGRA premultiplied (GDI DIB).
         // Reinterpret each 4-byte pixel as a u32 and swap the R and B nibbles.
@@ -111,6 +122,8 @@ impl Renderer {
             d[2] = s[0];
             d[3] = s[3];
         }
+
+        let t_present_start = std::time::Instant::now();
 
         unsafe {
             let screen_dc = GetDC(std::ptr::null_mut());
@@ -139,12 +152,14 @@ impl Renderer {
             );
 
             ReleaseDC(std::ptr::null_mut(), screen_dc);
+        }
 
-            // Block until DWM's next vsync boundary. This phase-locks our updates to
-            // the display refresh cycle: every DWM frame gets exactly one cursor
-            // position update, eliminating the stutter caused by double-updates or
-            // skipped updates when the loop drifts relative to DWM timing.
-            DwmFlush();
+        let t_end = std::time::Instant::now();
+
+        RenderTimings {
+            paint_ms:   (t_copy_start   - t_paint_start).as_secs_f32() * 1000.0,
+            copy_ms:    (t_present_start - t_copy_start).as_secs_f32() * 1000.0,
+            present_ms: (t_end           - t_present_start).as_secs_f32() * 1000.0,
         }
     }
 

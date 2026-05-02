@@ -62,6 +62,12 @@ pub struct OverlayApp {
     pub last_mouse_pos: (f32, f32),
     // Exponentially smoothed mouse velocity (pixels/second) used for prediction.
     pub mouse_velocity: (f32, f32),
+    // Per-second timing diagnostics
+    pub diag_last_log_at: Instant,
+    pub diag_frame_intervals_ms: Vec<f32>,
+    pub diag_flush_ms: Vec<f32>,
+    pub diag_render_ms: Vec<f32>,
+    pub diag_cursor_delta_px: Vec<f32>,
     // winit / GPU � None until `resumed` creates the window
     pub window: Option<Arc<Window>>,
     pub renderer: Option<Renderer>,
@@ -175,6 +181,14 @@ impl ApplicationHandler for OverlayApp {
         if self.renderer.is_none() {
             return;
         }
+
+        // ---- Phase 1: sync to display vsync ----
+        // DwmFlush blocks until DWM starts compositing the next frame.
+        // Calling it HERE (not at the end) means GetCursorPos runs in the first
+        // microseconds after vsync fires -- the minimum possible sample-to-display lag.
+        let t_vsync = Instant::now();
+        crate::platform::sync_to_display();
+        let flush_ms = t_vsync.elapsed().as_secs_f32() * 1000.0;
 
         self.frame_count += 1;
         let now = Instant::now();
@@ -373,8 +387,21 @@ impl ApplicationHandler for OverlayApp {
             || self.render_state.speech_bubble_opacity > 0.0;
         let needs_repaint = cursor_moved || is_animating;
 
+        // ---- Phase 3: render ----
+        let t_render_start = Instant::now();
         if !self.is_occluded && needs_repaint {
             if let Some(renderer) = &mut self.renderer {
+                #[cfg(target_os = "windows")]
+                {
+                    use crate::overlay::windows_impl::RenderTimings;
+                    let timings: RenderTimings = renderer.render_frame(
+                        &self.render_state,
+                        &mut self.font_system,
+                        self.elapsed_secs,
+                    );
+                    let _ = timings; // individual fields logged via diag accumulator
+                }
+                #[cfg(not(target_os = "windows"))]
                 renderer.render_frame(
                     &self.render_state,
                     &mut self.font_system,
@@ -382,19 +409,57 @@ impl ApplicationHandler for OverlayApp {
                 );
             }
         }
+        let render_ms = t_render_start.elapsed().as_secs_f32() * 1000.0;
 
-        // Frame timing:
-        //
-        // On Windows, DwmFlush() (called inside render_frame) already blocks until
-        // the next DWM vsync boundary, so active frames are naturally phase-locked
-        // to the display refresh rate -- no additional sleep needed.
-        //
-        // When idle (nothing changed so render_frame was skipped), sleep one full
-        // frame budget so we don't burn CPU polling GetCursorPos at full speed.
+        // ---- Accumulate diagnostics ----
+        let frame_interval_ms = delta_seconds as f32 * 1000.0;
+        let cursor_delta = {
+            let dx = fresh.0 - self.last_mouse_pos.0;
+            let dy = fresh.1 - self.last_mouse_pos.1;
+            (dx * dx + dy * dy).sqrt()
+        };
+        self.diag_frame_intervals_ms.push(frame_interval_ms);
+        self.diag_flush_ms.push(flush_ms);
+        self.diag_render_ms.push(render_ms);
+        self.diag_cursor_delta_px.push(cursor_delta);
+
+        // ---- Emit diagnostic log once per second ----
+        if now.duration_since(self.diag_last_log_at).as_secs_f32() >= 1.0 {
+            self.diag_last_log_at = now;
+            let count = self.diag_frame_intervals_ms.len() as f32;
+            if count > 0.0 {
+                let avg = |v: &Vec<f32>| v.iter().copied().sum::<f32>() / v.len() as f32;
+                let max = |v: &Vec<f32>| v.iter().copied().fold(0.0f32, f32::max);
+                let min = |v: &Vec<f32>| v.iter().copied().fold(f32::MAX, f32::min);
+
+                let fi  = &self.diag_frame_intervals_ms;
+                let fl  = &self.diag_flush_ms;
+                let rn  = &self.diag_render_ms;
+                let cd  = &self.diag_cursor_delta_px;
+
+                log::info!(
+                    "[TIMING] frames={:.0} interval={:.2}/{:.2}/{:.2}ms \
+                     flush={:.2}/{:.2}/{:.2}ms render={:.2}/{:.2}/{:.2}ms \
+                     cursor_delta avg={:.1}px/frame  (min/avg/max)",
+                    count,
+                    min(fi), avg(fi), max(fi),
+                    min(fl), avg(fl), max(fl),
+                    min(rn), avg(rn), max(rn),
+                    avg(cd),
+                );
+            }
+            self.diag_frame_intervals_ms.clear();
+            self.diag_flush_ms.clear();
+            self.diag_render_ms.clear();
+            self.diag_cursor_delta_px.clear();
+        }
+
+        // ---- Frame pacing ----
+        // DwmFlush (called at the top of the next iteration) provides vsync pacing
+        // on Windows for active frames.  Idle frames and non-Windows use a coarse sleep.
         if !needs_repaint || self.is_occluded {
             std::thread::sleep(self.frame_budget);
         }
-        // On non-Windows there is no DwmFlush, so always apply the frame budget.
         #[cfg(not(target_os = "windows"))]
         {
             let frame_elapsed = now.elapsed();

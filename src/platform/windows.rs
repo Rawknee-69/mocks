@@ -95,5 +95,15 @@ pub fn query_refresh_hz() -> u32 {
     60
 }
 
+/// Block until DWM's next vsync boundary.
+/// Must be called at the very START of the frame loop (before GetCursorPos) so the
+/// cursor sample happens right at the vsync boundary with minimum pipeline delay.
+/// Do NOT call this at the end of the frame -- that would add a full extra frame of lag.
+#[cfg(target_os = "windows")]
+pub fn sync_to_display() {
+    use windows_sys::Win32::Graphics::Dwm::DwmFlush;
+    unsafe { DwmFlush(); }
+}
+
 #[cfg(not(target_os = "windows"))]
 pub fn setup_windows_overlay(_hwnd: isize) {}
