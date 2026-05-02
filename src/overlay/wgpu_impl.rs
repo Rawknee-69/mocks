@@ -196,7 +196,7 @@ impl Renderer {
         self.pixmap = tiny_skia::Pixmap::new(w, h).expect("pixmap");
     }
 
-    pub fn render_frame(&mut self, render_state: &OverlayRenderState, font_system: &mut FontSystem, elapsed_secs: f64) {
+    pub fn render_frame(&mut self, render_state: &mut OverlayRenderState, font_system: &mut FontSystem, elapsed_secs: f64) {
         crate::overlay::paint::draw_overlay_frame(&mut self.pixmap, render_state, font_system, &mut self.swash_cache, elapsed_secs);
 
         self.queue.write_texture(

@@ -29,6 +29,7 @@ pub trait CursorTracker: Send {
     /// Called each frame with the window-reported mouse position.
     /// Implementations that read from the window (like RaylibFallbackTracker)
     /// use this to stay current. Others ignore it.
+    #[allow(dead_code)]
     fn update_from_window(&self, _x: f32, _y: f32) {}
 }
 

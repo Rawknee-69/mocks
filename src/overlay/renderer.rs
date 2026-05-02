@@ -75,6 +75,16 @@ pub struct OverlayRenderState {
     pub speech_bubble_visible_char_progress: f32,
     pub speech_bubble_visible_char_count: usize,
     pub speech_bubble_opacity: f32,
+    /// Cached visible text string — rebuilt only when `speech_bubble_visible_char_count` changes.
+    pub speech_bubble_visible_text: String,
+    /// The char count at which `speech_bubble_visible_text` was last built.
+    /// Set to `usize::MAX` to force a re-layout on next draw.
+    pub speech_bubble_cached_char_count: usize,
+    /// Persistent cosmic-text layout buffer — allocated once, reused every frame.
+    /// `None` until the first draw call; recreated if `speech_bubble_buffer_width` changes.
+    pub speech_bubble_buffer: Option<cosmic_text::Buffer>,
+    /// The `max_text_width` the buffer was created for; used to detect when a resize is needed.
+    pub speech_bubble_buffer_width: f32,
 }
 
 impl OverlayRenderState {
@@ -93,6 +103,10 @@ impl OverlayRenderState {
             speech_bubble_visible_char_progress: 0.0,
             speech_bubble_visible_char_count: 0,
             speech_bubble_opacity: 0.0,
+            speech_bubble_visible_text: String::new(),
+            speech_bubble_cached_char_count: usize::MAX,
+            speech_bubble_buffer: None,
+            speech_bubble_buffer_width: 0.0,
         }
     }
 
@@ -118,8 +132,12 @@ impl OverlayRenderState {
                     .speech_bubble_visible_char_progress
                     + delta_seconds as f32 * char_speed)
                     .min(self.speech_bubble_text.len() as f32);
-                self.speech_bubble_visible_char_count =
-                    self.speech_bubble_visible_char_progress.floor() as usize;
+                let new_count = self.speech_bubble_visible_char_progress.floor() as usize;
+                if new_count != self.speech_bubble_visible_char_count {
+                    self.speech_bubble_visible_char_count = new_count;
+                    // Invalidate cached visible text so paint.rs rebuilds it.
+                    self.speech_bubble_cached_char_count = usize::MAX;
+                }
             }
         } else if self.navigation_mode == CursorNavigationMode::ReturningToMouse
             || self.navigation_mode == CursorNavigationMode::FollowingMouse
@@ -129,6 +147,7 @@ impl OverlayRenderState {
             if self.speech_bubble_opacity <= 0.0 {
                 self.speech_bubble_visible_char_progress = 0.0;
                 self.speech_bubble_visible_char_count = 0;
+                self.speech_bubble_cached_char_count = usize::MAX;
             }
         }
     }
@@ -188,6 +207,8 @@ impl OverlayRenderState {
                     self.speech_bubble_opacity = 0.0;
                     self.speech_bubble_visible_char_progress = 0.0;
                     self.speech_bubble_visible_char_count = 0;
+                    self.speech_bubble_visible_text.clear();
+                    self.speech_bubble_cached_char_count = usize::MAX;
                 } else {
                     self.navigation_mode = CursorNavigationMode::PointingAtTarget;
                 }
@@ -213,6 +234,8 @@ impl OverlayRenderState {
         self.speech_bubble_visible_char_progress = 0.0;
         self.speech_bubble_visible_char_count = 0;
         self.speech_bubble_opacity = 0.0;
+        self.speech_bubble_visible_text.clear();
+        self.speech_bubble_cached_char_count = usize::MAX;
     }
 
     /// Starts a bezier return flight from current position back to mouse.
@@ -225,6 +248,8 @@ impl OverlayRenderState {
         self.speech_bubble_opacity = 0.0;
         self.speech_bubble_visible_char_progress = 0.0;
         self.speech_bubble_visible_char_count = 0;
+        self.speech_bubble_visible_text.clear();
+        self.speech_bubble_cached_char_count = usize::MAX;
     }
 
     /// Returns the cursor to following the mouse (instant, no animation).
@@ -233,6 +258,8 @@ impl OverlayRenderState {
         self.speech_bubble_opacity = 0.0;
         self.speech_bubble_visible_char_progress = 0.0;
         self.speech_bubble_visible_char_count = 0;
+        self.speech_bubble_visible_text.clear();
+        self.speech_bubble_cached_char_count = usize::MAX;
         self.cursor_rotation_degrees = design_system::cursor::DEFAULT_ROTATION_DEGREES;
         self.cursor_scale = 1.0;
     }

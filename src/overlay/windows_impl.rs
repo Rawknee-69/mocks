@@ -89,7 +89,7 @@ impl Renderer {
 
     pub fn render_frame(
         &mut self,
-        render_state: &OverlayRenderState,
+        render_state: &mut OverlayRenderState,
         font_system: &mut FontSystem,
         elapsed_secs: f64,
     ) -> RenderTimings {
@@ -183,6 +183,7 @@ fn create_dib(
 
     unsafe {
         let mem_dc = CreateCompatibleDC(std::ptr::null_mut());
+        assert!(!mem_dc.is_null(), "CreateCompatibleDC returned null");
 
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -210,6 +211,12 @@ fn create_dib(
             std::ptr::null_mut(),
             0,
         );
+
+        if hbitmap.is_null() {
+            // Free the DC before panicking so we don't leak the GDI object.
+            DeleteDC(mem_dc);
+            panic!("CreateDIBSection returned null for {}x{} — out of GDI memory?", width, height);
+        }
 
         SelectObject(mem_dc, hbitmap);
 

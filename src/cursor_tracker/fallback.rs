@@ -18,6 +18,7 @@ impl RaylibFallbackTracker {
     }
 
     /// Called from the main loop to feed Raylib's mouse position into the tracker.
+    #[allow(dead_code)]
     pub fn update(&self, x: f32, y: f32) {
         self.x.store(x as i32, Ordering::Relaxed);
         self.y.store(y as i32, Ordering::Relaxed);

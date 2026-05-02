@@ -30,7 +30,10 @@ High-level flow:
 ## Tech Stack
 
 - Rust
-- `raylib` for the transparent overlay renderer
+- `winit 0.30` for the native window (Win32/X11/Wayland), transparent + undecorated
+- `wgpu 22` for GPU presentation (Vulkan/DX12/Metal/GL backends)
+- `tiny-skia 0.11` for CPU rasterisation of triangles, arcs, bezier paths (uploaded as wgpu texture each frame)
+- `cosmic-text 0.12` for font shaping and text rendering
 - `tokio` for async runtime
 - `reqwest` and `tokio-tungstenite` for HTTP and WebSocket APIs
 - `cpal` for microphone capture
@@ -42,7 +45,7 @@ High-level flow:
 ## Code Layout
 
 - `src/main.rs`
-  - 60 FPS Raylib render loop that wires together hotkeys, async tasks, audio, overlay, and state transitions.
+  - winit event loop wiring together hotkeys, async tasks, audio, overlay, and state transitions.
 - `src/app/`
   - Platform detection and the `VoiceState` state machine.
 - `src/core/`
@@ -50,7 +53,9 @@ High-level flow:
 - `src/api/`
   - Claude SSE, Claude Computer Use, ElevenLabs, and AssemblyAI integrations.
 - `src/overlay/`
-  - Transparent Raylib overlay: triangle cursor, bloom, waveform, loading arc, speech bubble, flight animation.
+  - wgpu + winit transparent overlay: `window.rs` (winit `OverlayApp`), `renderer.rs` (animation state), `paint.rs` (tiny-skia draw calls), `gpu.rs` (wgpu device/surface/pipeline init).
+- `src/platform/`
+  - Per-OS window setup: `windows.rs` (DWM glass, `WS_EX_LAYERED|TRANSPARENT`, `DwmExtendFrameIntoClientArea`), `linux_x11.rs`, `linux_wayland.rs`.
 - `src/tray/`
   - Tray icon and menu integration.
 - `src/panel/`
@@ -81,9 +86,13 @@ High-level flow:
 
 ## Platform Notes
 
-- Wayland cursor tracking uses `evdev` because Raylib mouse tracking does not work reliably with click-through passthrough windows.
-- X11 uses Raylib fallback cursor tracking.
+- Wayland cursor tracking uses `evdev` because winit mouse tracking does not work reliably with click-through passthrough windows.
+- X11 uses a fallback cursor tracker based on atomics (`RaylibFallbackTracker` — legacy name, no Raylib dependency).
 - Screenshot capture differs by compositor and display server.
+- Windows overlay renders via `UpdateLayeredWindow` (not wgpu surface present directly); wgpu drives the pipeline, output pixels are RGBA→BGRA copied to the layered window bitmap.
+- On Windows, only the Vulkan backend exposes `PreMultiplied` alpha mode; DX12 only gives `Opaque`. The overlay requires Vulkan for real per-pixel transparency.
+- `DwmFlush()` must be called at the **start** of each frame (before cursor sample), not at the end — it gates the loop to vsync. Adding `thread::sleep(frame_budget)` after `DwmFlush` double-sleeps and halves the frame rate.
+- Debug builds with tiny-skia render at ~54ms/frame on a 1920×1080 overlay without optimizations. Fixed by `[profile.dev] opt-level=1` + `[profile.dev.package."*"] opt-level=2` in Cargo.toml (already present in the repo).
 
 ## Config
 
@@ -187,6 +196,7 @@ Backend `.env` (at `backend/.env`): `ASSEMBLYAI_API_KEY`, `ANTHROPIC_API_KEY`, `
 - `clicky-types` crate is the single source of truth for all shared WS message types; never duplicate these types in frontend or backend.
 - `backend/src/error.rs` and `backend/src/logger.rs` implement centralised error handling and structured logging (log level controlled via `LOG_LEVEL` env var; off in prod).
 - `src/api/adapter.rs` is the only file in the frontend that knows about the WebSocket connection; all other frontend code communicates through `UiEvent` as before.
-- Windows build requires CMake (`winget install Kitware.CMake`) and LLVM (`winget install LLVM.LLVM`) with `LIBCLANG_PATH=C:\Program Files\LLVM\bin` set; `raylib-sys` and `bindgen` need these at build time.
-- The Tokio render-loop pattern: call `let _tokio_guard = tokio_rt.enter()` before `ApiAdapter::connect` so all `tokio::spawn` / `spawn_blocking` calls in the synchronous 60fps render loop work without "no reactor running" panics.
-- Windows transparent overlay correctness: keep `WS_EX_LAYERED` (required for GLFW transparent framebuffer compositing), add `WS_EX_TRANSPARENT` for click-through, never call `SetLayeredWindowAttributes`, and do NOT set `FLAG_WINDOW_MOUSE_PASSTHROUGH` in Raylib (it calls `SetLayeredWindowAttributes` internally and breaks per-pixel alpha).
+- Windows build requires CMake (`winget install Kitware.CMake`) and LLVM (`winget install LLVM.LLVM`) with `LIBCLANG_PATH=C:\Program Files\LLVM\bin` set; `bindgen` needs these at build time.
+- The Tokio render-loop pattern: call `let _tokio_guard = tokio_rt.enter()` before `ApiAdapter::connect` so all `tokio::spawn` / `spawn_blocking` calls in the synchronous event loop work without "no reactor running" panics.
+- Windows transparent overlay correctness: keep `WS_EX_LAYERED` (required for `UpdateLayeredWindow`), add `WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` for click-through, call `DwmExtendFrameIntoClientArea` with all-(-1) MARGINS for DWM "sheet of glass" compositing. Do NOT add `WS_EX_NOREDIRECTIONBITMAP` alongside `WS_EX_LAYERED` — they conflict and break DWM compositing.
+- `pollster::block_on` must be used (not `.await` or `tokio::Handle::current().block_on`) for async wgpu init calls inside the winit event loop, since the event loop runs inside a tokio context and nesting `block_on` panics.

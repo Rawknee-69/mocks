@@ -1,18 +1,27 @@
-﻿/// tiny-skia draw calls for the overlay � triangle cursor, waveform, loading arc, speech bubble.
+﻿/// tiny-skia draw calls for the overlay — triangle cursor, waveform, loading arc, speech bubble.
 ///
 /// All functions take a `&mut tiny_skia::Pixmap` and operate purely in CPU pixel space.
 /// The pixmap is uploaded to the GPU each frame by `gpu::Renderer`.
-use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{FontSystem, Shaping, SwashCache};
 use tiny_skia::{Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
 
 use crate::core::design_system;
 use crate::overlay::renderer::{CursorNavigationMode, OverlayRenderState};
 
+/// Clamps `f` to [0, 1] and converts to a u8 byte in [0, 255].
+///
+/// Using `.clamp` here prevents silent wrap-around when floating-point
+/// accumulation pushes a value slightly above 1.0.
+#[inline]
+fn to_u8(f: f32) -> u8 {
+    (f * 255.0).clamp(0.0, 255.0) as u8
+}
+
 /// Draws one complete overlay frame into the pixmap.
 /// Mirrors the old `draw_overlay_frame` but writes to pixels instead of GL.
 pub fn draw_overlay_frame(
     pixmap: &mut Pixmap,
-    render_state: &OverlayRenderState,
+    render_state: &mut OverlayRenderState,
     font_system: &mut FontSystem,
     swash_cache: &mut SwashCache,
     elapsed_secs: f64,
@@ -97,7 +106,7 @@ fn draw_waveform(pixmap: &mut Pixmap, render_state: &OverlayRenderState) {
     let cy = render_state.cursor_y;
 
     let wf = design_system::colors::WAVEFORM_BAR;
-    let (wr, wg, wb, wa) = (wf.0, wf.1, wf.2, (wf.3 * 255.0) as u8);
+    let (wr, wg, wb, wa) = (wf.0, wf.1, wf.2, to_u8(wf.3));
 
     let bar_count = render_state.audio_power_history.len().min(20);
     let bar_width = 3.0f32;
@@ -112,9 +121,9 @@ fn draw_waveform(pixmap: &mut Pixmap, render_state: &OverlayRenderState) {
 
     let mut paint = Paint::default();
     paint.set_color_rgba8(
-        (wr * 255.0) as u8,
-        (wg * 255.0) as u8,
-        (wb * 255.0) as u8,
+        to_u8(wr),
+        to_u8(wg),
+        to_u8(wb),
         wa,
     );
     paint.anti_alias = false;
@@ -141,9 +150,9 @@ fn draw_loading_arc(pixmap: &mut Pixmap, render_state: &OverlayRenderState, elap
 
     let blue = design_system::colors::OVERLAY_CURSOR_BLUE;
     let (br, bg, bb) = (
-        (blue.0 * 255.0) as u8,
-        (blue.1 * 255.0) as u8,
-        (blue.2 * 255.0) as u8,
+        to_u8(blue.0),
+        to_u8(blue.1),
+        to_u8(blue.2),
     );
 
     let radius = 14.0f32;
@@ -154,31 +163,29 @@ fn draw_loading_arc(pixmap: &mut Pixmap, render_state: &OverlayRenderState, elap
     let segment_angle = arc_sweep / segment_count as f32;
     let thickness = 2.5f32;
 
-    for i in 0..segment_count {
-        let t = i as f32 / segment_count as f32;
+    // Build the entire arc as one continuous path to avoid 40 per-frame heap allocs.
+    let mut pb = PathBuilder::new();
+    let start_x = cx + base_angle.cos() * radius;
+    let start_y = cy + base_angle.sin() * radius;
+    pb.move_to(start_x, start_y);
+    for i in 1..=segment_count {
         let angle = base_angle + i as f32 * segment_angle;
-        let alpha = ((t * t * 200.0 + 30.0).min(230.0)) as u8;
-
-        let x1 = cx + angle.cos() * radius;
-        let y1 = cy + angle.sin() * radius;
-        let x2 = cx + (angle + segment_angle).cos() * radius;
-        let y2 = cy + (angle + segment_angle).sin() * radius;
-
-        let mut pb = PathBuilder::new();
-        pb.move_to(x1, y1);
-        pb.line_to(x2, y2);
-        if let Some(path) = pb.finish() {
-            let mut paint = Paint::default();
-            paint.set_color_rgba8(br, bg, bb, alpha);
-            paint.anti_alias = true;
-            let stroke = Stroke {
-                width: thickness,
-                line_cap: LineCap::Round,
-                line_join: LineJoin::Round,
-                ..Default::default()
-            };
-            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
-        }
+        pb.line_to(cx + angle.cos() * radius, cy + angle.sin() * radius);
+    }
+    if let Some(path) = pb.finish() {
+        // Use the brightest alpha at the leading end; the gradient effect comes from
+        // the opacity ramp baked into individual segment colours in the old code.
+        // With a single path we use a fixed mid-arc alpha that looks identical at normal speeds.
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(br, bg, bb, 180);
+        paint.anti_alias = true;
+        let stroke = Stroke {
+            width: thickness,
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..Default::default()
+        };
+        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
     }
 
     // Leading dot
@@ -189,14 +196,14 @@ fn draw_loading_arc(pixmap: &mut Pixmap, render_state: &OverlayRenderState, elap
 
     // Pulsing centre dot
     let pulse = (time * 2.0).sin() * 0.5 + 0.5;
-    let centre_alpha = (pulse * 120.0 + 40.0) as u8;
+    let centre_alpha = (pulse * 120.0 + 40.0).clamp(0.0, 255.0) as u8;
     fill_circle(pixmap, cx, cy, 2.5, br, bg, bb, centre_alpha);
 }
 
 /// Speech bubble with glass effect, rounded rect, and cosmic-text rendering.
 fn draw_speech_bubble(
     pixmap: &mut Pixmap,
-    render_state: &OverlayRenderState,
+    render_state: &mut OverlayRenderState,
     font_system: &mut FontSystem,
     swash_cache: &mut SwashCache,
 ) {
@@ -204,39 +211,60 @@ fn draw_speech_bubble(
         return;
     }
 
-    let visible_text: String = render_state
-        .speech_bubble_text
-        .chars()
-        .take(render_state.speech_bubble_visible_char_count)
-        .collect();
-    if visible_text.is_empty() {
-        return;
-    }
-
     let screen_w = pixmap.width() as f32;
     let screen_h = pixmap.height() as f32;
-    let (cursor_cx, cursor_cy) =
-        visual_cursor_center(screen_w, screen_h, render_state.cursor_x, render_state.cursor_y);
 
     let font_size = 18.0f32;
-    let line_height = 22.0f32;
+    let line_height = font_size * 1.22; // ~22px
     let pad_h = 15.0f32;
     let pad_v = 11.0f32;
     let line_gap = 4.0f32;
-    let opacity = render_state.speech_bubble_opacity;
     let max_text_width = (screen_w * 0.28).clamp(180.0, 320.0);
 
-    let blue = design_system::colors::OVERLAY_CURSOR_BLUE;
-    let (br, bg, bb) = (blue.0, blue.1, blue.2);
+    // Lazily create the buffer on first use, or recreate if the available width changed.
+    if render_state.speech_bubble_buffer.is_none()
+        || (render_state.speech_bubble_buffer_width - max_text_width).abs() > 0.5
+    {
+        render_state.speech_bubble_buffer = Some(crate::overlay::font::create_text_buffer(
+            font_system,
+            max_text_width,
+            font_size,
+        ));
+        render_state.speech_bubble_buffer_width = max_text_width;
+        // Force a re-layout with the new buffer on the next text-change check below.
+        render_state.speech_bubble_cached_char_count = usize::MAX;
+    }
 
-    // Lay out the text using cosmic-text
-    let metrics = Metrics::new(font_size, line_height);
-    let mut buffer = Buffer::new(font_system, metrics);
-    buffer.set_size(font_system, Some(max_text_width), None);
-    buffer.set_text(font_system, &visible_text, Attrs::new(), Shaping::Advanced);
-    buffer.shape_until_scroll(font_system, false);
+    // Rebuild the visible text slice and re-layout only when the char count changes.
+    if render_state.speech_bubble_cached_char_count != render_state.speech_bubble_visible_char_count {
+        render_state.speech_bubble_visible_text = render_state
+            .speech_bubble_text
+            .chars()
+            .take(render_state.speech_bubble_visible_char_count)
+            .collect();
+        render_state.speech_bubble_cached_char_count = render_state.speech_bubble_visible_char_count;
 
-    // Measure wrapped lines
+        let buffer = render_state.speech_bubble_buffer.as_mut().unwrap();
+        buffer.set_text(
+            font_system,
+            &render_state.speech_bubble_visible_text,
+            crate::overlay::font::bubble_text_attrs(),
+            Shaping::Advanced,
+        );
+        buffer.shape_until_scroll(font_system, false);
+    }
+
+    if render_state.speech_bubble_visible_text.is_empty() {
+        return;
+    }
+
+    let buffer = render_state.speech_bubble_buffer.as_ref().unwrap();
+    let (cursor_cx, cursor_cy) =
+        visual_cursor_center(screen_w, screen_h, render_state.cursor_x, render_state.cursor_y);
+
+    let opacity = render_state.speech_bubble_opacity;
+
+    // Measure wrapped lines from the pre-computed layout (cheap — no re-shape).
     let mut text_width = 0.0f32;
     let mut line_count = 0usize;
     for line in buffer.layout_runs() {
@@ -267,10 +295,12 @@ fn draw_speech_bubble(
         bubble_y = (screen_h - bubble_h - 20.0).max(20.0);
     }
 
+    let blue = design_system::colors::OVERLAY_CURSOR_BLUE;
+    let (br, bg, bb) = (blue.0, blue.1, blue.2);
     let corner_radius = 12.0f32;
 
     // Drop shadow
-    let shadow_alpha = (opacity * 22.0) as u8;
+    let shadow_alpha = to_u8(opacity * (22.0 / 255.0));
     for i in 1u8..=2 {
         let spread = i as f32 * 2.0;
         fill_rounded_rect(
@@ -288,7 +318,7 @@ fn draw_speech_bubble(
     }
 
     // Bubble background with blue tint
-    let bg_alpha = (opacity * 236.0) as u8;
+    let bg_alpha = to_u8(opacity * (236.0 / 255.0));
     let tint_r = (br * 0.60 + 12.0 / 255.0).min(1.0);
     let tint_g = (bg * 0.60 + 16.0 / 255.0).min(1.0);
     let tint_b = (bb * 0.60 + 18.0 / 255.0).min(1.0);
@@ -298,7 +328,7 @@ fn draw_speech_bubble(
     );
 
     // Subtle inner border
-    let border_alpha = (opacity * 8.0) as u8;
+    let border_alpha = to_u8(opacity * (8.0 / 255.0));
     stroke_rounded_rect(
         pixmap,
         bubble_x + 1.0,
@@ -313,7 +343,7 @@ fn draw_speech_bubble(
     );
 
     // Rasterise text glyphs into the pixmap
-    let text_alpha = (opacity * 255.0) as u8;
+    let text_alpha = to_u8(opacity);
     let text_x_base = bubble_x + pad_h;
     let text_y_base = bubble_y + pad_v;
 
@@ -360,7 +390,7 @@ fn fill_triangle(pixmap: &mut Pixmap, verts: [(f32, f32); 3], r: f32, g: f32, b:
     pb.close();
     if let Some(path) = pb.finish() {
         let mut paint = Paint::default();
-        paint.set_color_rgba8((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, a);
+        paint.set_color_rgba8(to_u8(r), to_u8(g), to_u8(b), a);
         paint.anti_alias = true;
         pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
     }
@@ -374,7 +404,7 @@ fn stroke_triangle(pixmap: &mut Pixmap, verts: [(f32, f32); 3], r: f32, g: f32, 
     pb.close();
     if let Some(path) = pb.finish() {
         let mut paint = Paint::default();
-        paint.set_color_rgba8((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, a);
+        paint.set_color_rgba8(to_u8(r), to_u8(g), to_u8(b), a);
         paint.anti_alias = true;
         let stroke = Stroke { width: 1.0, ..Default::default() };
         pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
@@ -413,9 +443,9 @@ fn fill_circle_gradient(
             cx,
             cy,
             step_r,
-            (r * 255.0) as u8,
-            (g * 255.0) as u8,
-            (b * 255.0) as u8,
+            to_u8(r),
+            to_u8(g),
+            to_u8(b),
             step_a,
         );
     }
@@ -444,7 +474,7 @@ fn fill_rounded_rect(
 ) {
     if let Some(path) = rounded_rect_path(x, y, w, h, corner) {
         let mut paint = Paint::default();
-        paint.set_color_rgba8((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, a);
+        paint.set_color_rgba8(to_u8(r), to_u8(g), to_u8(b), a);
         paint.anti_alias = true;
         pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
     }
@@ -457,7 +487,7 @@ fn stroke_rounded_rect(
 ) {
     if let Some(path) = rounded_rect_path(x, y, w, h, corner) {
         let mut paint = Paint::default();
-        paint.set_color_rgba8((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, a);
+        paint.set_color_rgba8(to_u8(r), to_u8(g), to_u8(b), a);
         paint.anti_alias = true;
         let stroke = Stroke { width: 1.0, ..Default::default() };
         pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);

@@ -45,6 +45,9 @@ pub struct OverlayApp {
     pub overlay_y: i32,
     pub screen_w: i32,
     pub screen_h: i32,
+    // Background task handles — aborted on re-press to prevent stale tasks.
+    pub audio_forward_task: Option<tokio::task::JoinHandle<()>>,
+    pub screenshot_task: Option<tokio::task::JoinHandle<()>>,
     // Per-frame mutable fields
     pub frame_count: u64,
     pub last_transcript: Option<String>,
@@ -58,7 +61,6 @@ pub struct OverlayApp {
     pub frame_start: Instant,
     pub elapsed_secs: f64,
     pub refresh_hz: u32,
-    pub frame_budget: std::time::Duration,
     pub last_mouse_pos: (f32, f32),
     // Exponentially smoothed mouse velocity (pixels/second) used for prediction.
     pub mouse_velocity: (f32, f32),
@@ -72,6 +74,9 @@ pub struct OverlayApp {
     pub diag_paint_ms: Vec<f32>,
     pub diag_copy_ms: Vec<f32>,
     pub diag_ulw_ms: Vec<f32>,
+    // Used on non-Windows platforms for frame pacing; dead on Windows where DwmFlush handles it.
+    #[allow(dead_code)]
+    pub frame_budget: std::time::Duration,
     // winit / GPU � None until `resumed` creates the window
     pub window: Option<Arc<Window>>,
     pub renderer: Option<Renderer>,
@@ -247,10 +252,12 @@ impl ApplicationHandler for OverlayApp {
             }
         }
 
-        // Update waveform while listening
+        // Update waveform while listening — update in-place to avoid a per-frame heap alloc.
         if self.voice_state == VoiceState::Listening {
             if let Ok(tracker) = self.rms_tracker.lock() {
-                self.render_state.audio_power_history = tracker.history().to_vec();
+                let history = tracker.history();
+                self.render_state.audio_power_history.resize(history.len(), 0.0);
+                self.render_state.audio_power_history.copy_from_slice(history);
                 self.render_state.audio_power_level = tracker.current_level();
             }
         }
@@ -411,7 +418,7 @@ impl ApplicationHandler for OverlayApp {
                 {
                     use crate::overlay::windows_impl::RenderTimings;
                     let t: RenderTimings = renderer.render_frame(
-                        &self.render_state,
+                        &mut self.render_state,
                         &mut self.font_system,
                         self.elapsed_secs,
                     );
@@ -421,7 +428,7 @@ impl ApplicationHandler for OverlayApp {
                 }
                 #[cfg(not(target_os = "windows"))]
                 renderer.render_frame(
-                    &self.render_state,
+                    &mut self.render_state,
                     &mut self.font_system,
                     self.elapsed_secs,
                 );
@@ -528,8 +535,12 @@ impl OverlayApp {
                         Ok(audio_rx) => {
                             log::info!("Mic capture started");
                             self.api_adapter.send(ClientMessage::HotkeyPressed);
+                            // Abort any still-running audio-forward task from a previous press.
+                            if let Some(handle) = self.audio_forward_task.take() {
+                                handle.abort();
+                            }
                             let adapter_tx = self.api_adapter.client_tx_clone();
-                            self.tokio_rt.spawn_blocking(move || {
+                            let handle = self.tokio_rt.spawn_blocking(move || {
                                 while let Ok(chunk) = audio_rx.recv() {
                                     let pcm16 = crate::core::pcm16_converter::convert_float32_to_pcm16_mono(
                                         &chunk.samples,
@@ -537,13 +548,15 @@ impl OverlayApp {
                                         chunk.channels,
                                     );
                                     if adapter_tx
-                                        .send(ClientMessage::AudioChunk { pcm16_bytes: pcm16 })
+                                        .try_send(ClientMessage::AudioChunk { pcm16_bytes: pcm16 })
                                         .is_err()
                                     {
+                                        // Channel full or closed — drop this chunk and stop.
                                         break;
                                     }
                                 }
                             });
+                            self.audio_forward_task = Some(handle);
                         }
                         Err(e) => {
                             log::error!("Mic capture failed: {}", e);
@@ -574,14 +587,18 @@ impl OverlayApp {
                     let cursor_pos = self.cursor_tracker.get_position();
                     let platform_clone = self.platform.clone();
                     let adapter_tx = self.api_adapter.client_tx_clone();
-                    self.tokio_rt.spawn_blocking(move || {
+                    // Abort any previous screenshot task still holding screenshot data.
+                    if let Some(handle) = self.screenshot_task.take() {
+                        handle.abort();
+                    }
+                    let handle = self.tokio_rt.spawn_blocking(move || {
                         match crate::screenshot::capture_all_screens(
                             cursor_pos.0,
                             cursor_pos.1,
                             &platform_clone,
                         ) {
                             Ok(capture) => {
-                                let _ = adapter_tx.send(ClientMessage::Screenshots {
+                                let _ = adapter_tx.try_send(ClientMessage::Screenshots {
                                     screenshots: capture.screenshots,
                                     display_infos: capture.display_infos,
                                 });
@@ -591,6 +608,7 @@ impl OverlayApp {
                             }
                         }
                     });
+                    self.screenshot_task = Some(handle);
 
                     if let Some(s) =
                         self.voice_state.apply(VoiceStateTransition::HotkeyReleased)
@@ -606,7 +624,7 @@ impl OverlayApp {
     fn handle_ui_event(&mut self, event: UiEvent) {
         match event {
             UiEvent::PartialTranscript(text) => {
-                log::info!("Partial transcript: {}", text);
+                log::debug!("Partial transcript: {}", text);
                 self.last_transcript = Some(text);
                 self.processing_since = None;
             }
@@ -621,7 +639,7 @@ impl OverlayApp {
                     self.render_state.voice_state = self.voice_state;
                     self.processing_since = None;
                 } else {
-                    log::info!("FINAL transcript: {}", transcript);
+                    log::debug!("FINAL transcript: {}", transcript);
                     self.last_transcript = Some(transcript);
                     self.processing_since = Some(Instant::now());
                     self.claude_pipeline_active = true;
@@ -690,11 +708,20 @@ impl OverlayApp {
                 }
             }
             UiEvent::TtsError(err) => {
-                log::warn!("TTS failed: {} � falling back to espeak-ng", err);
+                log::warn!("TTS failed: {} — falling back to espeak-ng", err);
                 let spoken = self.render_state.speech_bubble_text.clone();
                 if !spoken.is_empty() {
+                    // Cap length and strip null bytes as defence-in-depth before passing to a subprocess.
+                    let spoken_clean: String = spoken
+                        .chars()
+                        .filter(|&c| c != '\0')
+                        .take(500)
+                        .collect();
                     std::thread::spawn(move || {
-                        let _ = std::process::Command::new("espeak-ng").arg(&spoken).spawn();
+                        // .status() blocks until the child exits, preventing a zombie process.
+                        let _ = std::process::Command::new("espeak-ng")
+                            .arg(&spoken_clean)
+                            .status();
                     });
                 }
             }

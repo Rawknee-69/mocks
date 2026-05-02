@@ -87,6 +87,12 @@ fn main() {
 
     let (overlay_x, overlay_y, screen_w, screen_h) =
         screenshot::detect_overlay_bounds(&platform);
+    debug_assert!(
+        screen_w >= 0 && screen_h >= 0,
+        "detect_overlay_bounds returned negative dimensions: {}x{}",
+        screen_w,
+        screen_h
+    );
     info!(
         "Overlay bounds: origin=({}, {}) size={}x{}",
         overlay_x, overlay_y, screen_w, screen_h
@@ -136,6 +142,8 @@ fn main() {
         overlay_y,
         screen_w,
         screen_h,
+        audio_forward_task: None,
+        screenshot_task: None,
         frame_count: 0,
         last_transcript: None,
         processing_since: None,
@@ -155,13 +163,13 @@ fn main() {
         last_mouse_pos: (0.0, 0.0),
         mouse_velocity: (0.0, 0.0),
         diag_last_log_at: Instant::now(),
-        diag_frame_intervals_ms: Vec::with_capacity(300),
-        diag_flush_ms: Vec::with_capacity(300),
-        diag_render_ms: Vec::with_capacity(300),
-        diag_cursor_delta_px: Vec::with_capacity(300),
-        diag_paint_ms: Vec::with_capacity(300),
-        diag_copy_ms: Vec::with_capacity(300),
-        diag_ulw_ms: Vec::with_capacity(300),
+        diag_frame_intervals_ms: Vec::with_capacity(600),
+        diag_flush_ms: Vec::with_capacity(600),
+        diag_render_ms: Vec::with_capacity(600),
+        diag_cursor_delta_px: Vec::with_capacity(600),
+        diag_paint_ms: Vec::with_capacity(600),
+        diag_copy_ms: Vec::with_capacity(600),
+        diag_ulw_ms: Vec::with_capacity(600),
         window: None,
         renderer: None,
         is_occluded: false,

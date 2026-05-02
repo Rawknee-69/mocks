@@ -19,7 +19,7 @@ pub const BACKEND_PORT: u16 = 9001;
 /// Non-blocking interface between the 60fps render loop and the backend server.
 pub struct ApiAdapter {
     /// Send `ClientMessage` values to the background WS task.
-    client_tx: async_mpsc::UnboundedSender<ClientMessage>,
+    client_tx: async_mpsc::Sender<ClientMessage>,
     /// Receive `UiEvent` values produced by the background WS task.
     ui_event_rx: std_mpsc::Receiver<UiEvent>,
 }
@@ -29,7 +29,7 @@ impl ApiAdapter {
     ///
     /// Must be called from within a tokio runtime context.
     pub fn connect(port: u16) -> Self {
-        let (client_tx, client_rx) = async_mpsc::unbounded_channel::<ClientMessage>();
+        let (client_tx, client_rx) = async_mpsc::channel::<ClientMessage>(128);
         let (ui_event_tx, ui_event_rx) = std_mpsc::channel::<UiEvent>();
 
         tokio::spawn(ws_task(port, client_rx, ui_event_tx));
@@ -39,13 +39,13 @@ impl ApiAdapter {
 
     /// Queues a `ClientMessage` for delivery to the backend (non-blocking).
     pub fn send(&self, msg: ClientMessage) {
-        // Silently drop on disconnect — the ws_task will reconnect.
-        let _ = self.client_tx.send(msg);
+        // Silently drop on disconnect or when the channel is full — the ws_task will reconnect.
+        let _ = self.client_tx.try_send(msg);
     }
 
     /// Returns a clone of the underlying sender for use in background tasks
     /// (e.g. forwarding audio chunks from a blocking thread).
-    pub fn client_tx_clone(&self) -> async_mpsc::UnboundedSender<ClientMessage> {
+    pub fn client_tx_clone(&self) -> async_mpsc::Sender<ClientMessage> {
         self.client_tx.clone()
     }
 
@@ -82,7 +82,7 @@ impl ApiAdapter {
 /// so the render loop never needs to know about reconnects.
 async fn ws_task(
     port: u16,
-    mut client_rx: async_mpsc::UnboundedReceiver<ClientMessage>,
+    mut client_rx: async_mpsc::Receiver<ClientMessage>,
     ui_event_tx: std_mpsc::Sender<UiEvent>,
 ) {
     let url = format!("ws://127.0.0.1:{port}");

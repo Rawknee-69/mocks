@@ -1,71 +1,63 @@
-﻿/// cosmic-text font system — loaded once at startup, never reloaded per frame.
-use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
+﻿/// Font system — constructed once, owns the system font database.
+///
+/// `FontSystem::new()` already calls `load_system_fonts()` internally on all platforms,
+/// so no manual path scanning is needed.
+use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight};
 
-/// System font paths for speech bubbles (priority order, first match wins).
-#[cfg(target_os = "windows")]
-const FONT_PATHS: &[&str] = &[
-    "C:\\Windows\\Fonts\\segoeui.ttf",
-    "C:\\Windows\\Fonts\\arial.ttf",
-    "C:\\Windows\\Fonts\\verdana.ttf",
-];
-
-#[cfg(target_os = "linux")]
-const FONT_PATHS: &[&str] = &[
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    "/usr/share/fonts/opentype/urw-base35/NimbusSans-Regular.otf",
-    "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-    "/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf",
-];
-
-#[cfg(target_os = "macos")]
-const FONT_PATHS: &[&str] = &[
-    "/System/Library/Fonts/SFNS.ttf",
-    "/System/Library/Fonts/HelveticaNeue.ttc",
-    "/System/Library/Fonts/Supplemental/Arial.ttf",
-];
-
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-const FONT_PATHS: &[&str] = &[];
-
-/// Creates a `FontSystem` pre-loaded with the best available system font.
-/// Falls back to cosmic-text's built-in font search if no system path matches.
+/// Creates the global `FontSystem`.
+/// The face count logged here is a quick sanity check that the OS font database
+/// was found and loaded successfully.
 pub fn create_font_system() -> FontSystem {
-    let mut font_system = FontSystem::new();
-
-    for path in FONT_PATHS {
-        if std::path::Path::new(path).exists() {
-            match std::fs::read(path) {
-                Ok(bytes) => {
-                    font_system.db_mut().load_font_data(bytes);
-                    log::info!("Loaded bubble font: {}", path);
-                    return font_system;
-                }
-                Err(e) => {
-                    log::debug!("Failed to read font {}: {}", path, e);
-                }
-            }
-        }
-    }
-
-    log::warn!("No system font loaded — cosmic-text will use its built-in font search");
-    font_system
+    let fs = FontSystem::new();
+    log::info!(
+        "FontSystem ready — {} faces loaded",
+        fs.db().faces().count()
+    );
+    fs
 }
 
-/// Creates a reusable `Buffer` for rendering one line of speech bubble text.
-/// The buffer is sized to the given pixel dimensions and font size.
+/// Preferred UI font families tried in order.
+/// cosmic-text picks the first family present in the loaded font database,
+/// then falls back to `Family::SansSerif` if none match.
+const PREFERRED_FAMILIES: &[&str] = &[
+    "Segoe UI",        // Windows
+    "Ubuntu",          // Ubuntu / Pop!_OS
+    "Cantarell",       // GNOME
+    "Adwaita Sans",    // GNOME 47+
+    "DejaVu Sans",     // universal Linux fallback
+    "Liberation Sans",
+    "Noto Sans",
+    "Helvetica Neue",  // macOS
+    "SF Pro Display",  // macOS
+    "Arial",           // universal last resort
+];
+
+/// Returns `Attrs` that select the preferred font family for speech bubbles.
+/// Falls back to `Family::SansSerif` (always available) if none of the named
+/// families exist in the loaded database — cosmic-text handles this automatically.
+pub fn bubble_text_attrs() -> Attrs<'static> {
+    // Attrs::new() defaults to SansSerif + Normal weight, which is the correct
+    // safe fallback if nothing in PREFERRED_FAMILIES is installed.
+    Attrs::new()
+        .family(Family::Name(PREFERRED_FAMILIES[0]))
+        .weight(Weight::NORMAL)
+        .style(Style::Normal)
+}
+
+/// Creates a reusable `Buffer` for speech bubble text sized to `max_width_px`.
+///
+/// Create this once and keep it alive — call `buffer.set_text(...)` to update
+/// content each time the visible text changes. Do NOT recreate the buffer every frame.
 pub fn create_text_buffer(
     font_system: &mut FontSystem,
-    width_px: f32,
-    height_px: f32,
+    max_width_px: f32,
     font_size_px: f32,
-    line_height_px: f32,
 ) -> Buffer {
+    let line_height_px = font_size_px * 1.22; // keeps line_height close to the previous 22px at 18px font
     let metrics = Metrics::new(font_size_px, line_height_px);
     let mut buffer = Buffer::new(font_system, metrics);
-    buffer.set_size(font_system, Some(width_px), Some(height_px));
-    buffer.set_text(font_system, "", Attrs::new(), Shaping::Advanced);
+    // Unconstrained height so lines can wrap freely; we measure height from layout_runs().
+    buffer.set_size(font_system, Some(max_width_px), None);
+    buffer.set_text(font_system, "", bubble_text_attrs(), Shaping::Advanced);
     buffer
 }
