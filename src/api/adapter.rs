@@ -1,0 +1,206 @@
+/// WebSocket adapter — connects the frontend render loop to the backend pipeline server.
+///
+/// `ApiAdapter::connect()` spawns a background tokio task that maintains a WebSocket
+/// connection to `ws://127.0.0.1:PORT`.  The render loop calls `send()` and `try_recv()`
+/// every frame without blocking.
+///
+/// Auto-reconnect: if the connection drops the background task tries to reconnect
+/// with an exponential back-off (up to 5 seconds between attempts).
+use crate::audio::UiEvent;
+use crate::core::coordinate_mapper::DisplayInfo;
+use clicky_types::{ClientMessage, ErrorCode, ServerMessage};
+use std::sync::mpsc as std_mpsc;
+use tokio::sync::mpsc as async_mpsc;
+use tracing::{error, info, warn};
+
+/// The port the backend listens on — compile-time constant so the frontend
+/// never needs to read `.env` or any API key files.
+pub const BACKEND_PORT: u16 = 9001;
+
+/// Non-blocking interface between the 60fps render loop and the backend server.
+pub struct ApiAdapter {
+    /// Send `ClientMessage` values to the background WS task.
+    client_tx: async_mpsc::UnboundedSender<ClientMessage>,
+    /// Receive `UiEvent` values produced by the background WS task.
+    ui_event_rx: std_mpsc::Receiver<UiEvent>,
+}
+
+impl ApiAdapter {
+    /// Connects to `ws://127.0.0.1:port`, spawning the background WS task.
+    ///
+    /// Must be called from within a tokio runtime context.
+    pub fn connect(port: u16) -> Self {
+        let (client_tx, client_rx) = async_mpsc::unbounded_channel::<ClientMessage>();
+        let (ui_event_tx, ui_event_rx) = std_mpsc::channel::<UiEvent>();
+
+        tokio::spawn(ws_task(port, client_rx, ui_event_tx));
+
+        Self { client_tx, ui_event_rx }
+    }
+
+    /// Queues a `ClientMessage` for delivery to the backend (non-blocking).
+    pub fn send(&self, msg: ClientMessage) {
+        // Silently drop on disconnect — the ws_task will reconnect.
+        let _ = self.client_tx.send(msg);
+    }
+
+    /// Returns a clone of the underlying sender for use in background tasks
+    /// (e.g. forwarding audio chunks from a blocking thread).
+    pub fn client_tx_clone(&self) -> async_mpsc::UnboundedSender<ClientMessage> {
+        self.client_tx.clone()
+    }
+
+    /// Returns the next `UiEvent` if one is available, without blocking.
+    pub fn try_recv(&self) -> Option<UiEvent> {
+        self.ui_event_rx.try_recv().ok()
+    }
+}
+
+/// Background task: maintains the WebSocket connection and translates messages.
+///
+/// On disconnect it waits briefly then reconnects, preserving the channel handles
+/// so the render loop never needs to know about reconnects.
+async fn ws_task(
+    port: u16,
+    mut client_rx: async_mpsc::UnboundedReceiver<ClientMessage>,
+    ui_event_tx: std_mpsc::Sender<UiEvent>,
+) {
+    let url = format!("ws://127.0.0.1:{port}");
+    let mut backoff_ms: u64 = 250;
+
+    loop {
+        info!("adapter: connecting to {url}");
+        let (ws_stream, _) = match tokio_tungstenite::connect_async(&url).await {
+            Ok(ws) => ws,
+            Err(err) => {
+                warn!("adapter: connection failed ({err}), retrying in {backoff_ms}ms");
+                tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(5000);
+                continue;
+            }
+        };
+
+        backoff_ms = 250; // reset on successful connection
+        info!("adapter: connected to {url}");
+
+        let (mut ws_sink, mut ws_source) = futures_util::StreamExt::split(ws_stream);
+
+        // Run until the connection drops, then break out to reconnect
+        let disconnect = loop {
+            tokio::select! {
+                // Outgoing: client_rx → WebSocket
+                outgoing = client_rx.recv() => {
+                    let Some(msg) = outgoing else {
+                        // Channel closed — adapter was dropped, exit task
+                        return;
+                    };
+                    let json = match serde_json::to_string(&msg) {
+                        Ok(j) => j,
+                        Err(err) => {
+                            error!("adapter: failed to serialise ClientMessage: {err}");
+                            continue;
+                        }
+                    };
+                    if futures_util::SinkExt::send(
+                        &mut ws_sink,
+                        tokio_tungstenite::tungstenite::Message::Text(json.into()),
+                    ).await.is_err() {
+                        break true; // disconnect
+                    }
+                }
+
+                // Incoming: WebSocket → UiEvent
+                incoming = futures_util::StreamExt::next(&mut ws_source) => {
+                    match incoming {
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                            match serde_json::from_str::<ServerMessage>(&text) {
+                                Ok(server_msg) => {
+                                    if let Some(ui_event) = server_message_to_ui_event(server_msg) {
+                                        // Render loop has exited → stop
+                                        if ui_event_tx.send(ui_event).is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!("adapter: failed to parse ServerMessage: {err}");
+                                }
+                            }
+                        }
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
+                            break true; // disconnect
+                        }
+                        Some(Err(err)) => {
+                            warn!("adapter: WS receive error: {err}");
+                            break true;
+                        }
+                        Some(Ok(_)) => {} // ignore binary/ping/pong
+                    }
+                }
+            }
+        };
+
+        if disconnect {
+            warn!("adapter: disconnected, retrying in {backoff_ms}ms");
+            tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+            backoff_ms = (backoff_ms * 2).min(5000);
+        }
+    }
+}
+
+/// Converts a `ServerMessage` from the backend into a `UiEvent` for the render loop.
+///
+/// Returns `None` for messages that don't map to a `UiEvent`
+/// (e.g. `LlmTextDelta` which the render loop doesn't use yet).
+fn server_message_to_ui_event(msg: ServerMessage) -> Option<UiEvent> {
+    match msg {
+        ServerMessage::PartialTranscript { text } => {
+            Some(UiEvent::PartialTranscript(text))
+        }
+
+        ServerMessage::FinalTranscript { text } => {
+            Some(UiEvent::FinalTranscript(text))
+        }
+
+        ServerMessage::LlmTextDelta { .. } => {
+            // Not currently used by the render loop
+            None
+        }
+
+        ServerMessage::LlmResponse { spoken_text, coordinate, display_infos } => {
+            // Convert clicky_types::DisplayInfo → core::coordinate_mapper::DisplayInfo
+            let frontend_display_infos: Vec<DisplayInfo> = display_infos
+                .into_iter()
+                .map(|d| DisplayInfo {
+                    screen_number: d.screen_number,
+                    global_origin_x: d.global_origin_x,
+                    global_origin_y: d.global_origin_y,
+                    display_width_points: d.display_width_points,
+                    display_height_points: d.display_height_points,
+                    screenshot_width_pixels: d.screenshot_width_pixels,
+                    screenshot_height_pixels: d.screenshot_height_pixels,
+                    is_cursor_display: d.is_cursor_display,
+                })
+                .collect();
+
+            Some(UiEvent::LlmResponse {
+                spoken_text,
+                pointing_instruction: None, // backend resolves coords; no POINT tag needed here
+                display_infos: frontend_display_infos,
+                computer_use_global_coordinate: coordinate,
+            })
+        }
+
+        ServerMessage::TtsAudio { mp3_bytes } => {
+            Some(UiEvent::TtsAudio(mp3_bytes))
+        }
+
+        ServerMessage::Error { code, message } => {
+            match code {
+                ErrorCode::Transcription => Some(UiEvent::TranscriptionError(message)),
+                ErrorCode::Tts => Some(UiEvent::TtsError(message)),
+                _ => Some(UiEvent::PipelineError(message)),
+            }
+        }
+    }
+}
