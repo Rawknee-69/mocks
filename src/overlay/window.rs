@@ -369,8 +369,13 @@ impl ApplicationHandler for OverlayApp {
             predict_y - self.overlay_y as f32,
         );
 
-        let cursor_moved = (fresh.0 - self.last_mouse_pos.0).abs() > 0.5
-            || (fresh.1 - self.last_mouse_pos.1).abs() > 0.5;
+        // Capture delta BEFORE updating last_mouse_pos so the diag log is correct.
+        let cursor_delta_px = {
+            let dx = fresh.0 - self.last_mouse_pos.0;
+            let dy = fresh.1 - self.last_mouse_pos.1;
+            (dx * dx + dy * dy).sqrt()
+        };
+        let cursor_moved = cursor_delta_px > 0.5;
         self.last_mouse_pos = fresh;
 
         // In FollowingMouse mode, draw at the predicted position.
@@ -413,15 +418,10 @@ impl ApplicationHandler for OverlayApp {
 
         // ---- Accumulate diagnostics ----
         let frame_interval_ms = delta_seconds as f32 * 1000.0;
-        let cursor_delta = {
-            let dx = fresh.0 - self.last_mouse_pos.0;
-            let dy = fresh.1 - self.last_mouse_pos.1;
-            (dx * dx + dy * dy).sqrt()
-        };
         self.diag_frame_intervals_ms.push(frame_interval_ms);
         self.diag_flush_ms.push(flush_ms);
         self.diag_render_ms.push(render_ms);
-        self.diag_cursor_delta_px.push(cursor_delta);
+        self.diag_cursor_delta_px.push(cursor_delta_px);
 
         // ---- Emit diagnostic log once per second ----
         if now.duration_since(self.diag_last_log_at).as_secs_f32() >= 1.0 {
@@ -437,12 +437,19 @@ impl ApplicationHandler for OverlayApp {
                 let rn  = &self.diag_render_ms;
                 let cd  = &self.diag_cursor_delta_px;
 
+                let target_ms = 1000.0 / self.refresh_hz as f32;
+                let missed_frames = self.diag_frame_intervals_ms.iter()
+                    .filter(|&&t| t > target_ms * 1.5)
+                    .count();
                 log::info!(
-                    "[TIMING] frames={:.0} interval={:.2}/{:.2}/{:.2}ms \
-                     flush={:.2}/{:.2}/{:.2}ms render={:.2}/{:.2}/{:.2}ms \
-                     cursor_delta avg={:.1}px/frame  (min/avg/max)",
-                    count,
-                    min(fi), avg(fi), max(fi),
+                    "[TIMING {}/s target={:.1}ms] \
+                     interval={:.1}/{:.1}/{:.1}ms (missed={}) \
+                     flush={:.1}/{:.1}/{:.1}ms \
+                     render={:.1}/{:.1}/{:.1}ms \
+                     cursor={:.1}px/f",
+                    count as u32,
+                    target_ms,
+                    min(fi), avg(fi), max(fi), missed_frames,
                     min(fl), avg(fl), max(fl),
                     min(rn), avg(rn), max(rn),
                     avg(cd),
