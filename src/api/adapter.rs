@@ -1,4 +1,4 @@
-/// WebSocket adapter — connects the frontend render loop to the backend pipeline server.
+﻿/// WebSocket adapter — connects the frontend render loop to the backend pipeline server.
 ///
 /// `ApiAdapter::connect()` spawns a background tokio task that maintains a WebSocket
 /// connection to `ws://127.0.0.1:PORT`.  The render loop calls `send()` and `try_recv()`
@@ -47,6 +47,27 @@ impl ApiAdapter {
     /// (e.g. forwarding audio chunks from a blocking thread).
     pub fn client_tx_clone(&self) -> async_mpsc::UnboundedSender<ClientMessage> {
         self.client_tx.clone()
+    }
+
+
+    /// Attempts to connect to the backend with a 2-second timeout.
+    ///
+    /// Returns an error if the backend is unreachable within the timeout window.
+    /// Must be called from within a tokio runtime context.
+    pub async fn try_connect(port: u16) -> Result<Self, std::io::Error> {
+        let url = format!("ws://127.0.0.1:{port}");
+        let connect_future = tokio_tungstenite::connect_async(&url);
+        tokio::time::timeout(std::time::Duration::from_secs(2), connect_future)
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("backend at {url} did not respond within 2 seconds"),
+                )
+            })?
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.to_string()))?;
+
+        Ok(Self::connect(port))
     }
 
     /// Returns the next `UiEvent` if one is available, without blocking.
