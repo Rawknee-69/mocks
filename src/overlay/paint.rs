@@ -466,8 +466,20 @@ fn stroke_rounded_rect(
 
 fn visual_cursor_center(screen_w: f32, screen_h: f32, cursor_x: f32, cursor_y: f32) -> (f32, f32) {
     let offset = design_system::cursor::OFFSET_FROM_SYSTEM_CURSOR;
-    let radius = offset + design_system::cursor::TRIANGLE_SIZE * 1.5;
-    let cx = if cursor_x + radius > screen_w { cursor_x - offset } else { cursor_x + offset };
-    let cy = if cursor_y + radius > screen_h { cursor_y - offset } else { cursor_y + offset };
+    let triangle_radius = design_system::cursor::TRIANGLE_SIZE * 1.5;
+
+    // Smooth side-switching: blend from +offset to -offset over a transition zone
+    // instead of flipping instantly at the edge. This prevents the triangle from
+    // jumping when the cursor reaches the screen boundary.
+    let transition_zone = offset + triangle_radius;
+
+    let right_clearance = screen_w - cursor_x;
+    let t_x = ((right_clearance - triangle_radius) / transition_zone).clamp(0.0, 1.0);
+    let cx = cursor_x + offset * (2.0 * t_x - 1.0);
+
+    let bottom_clearance = screen_h - cursor_y;
+    let t_y = ((bottom_clearance - triangle_radius) / transition_zone).clamp(0.0, 1.0);
+    let cy = cursor_y + offset * (2.0 * t_y - 1.0);
+
     (cx.clamp(0.0, screen_w.max(0.0)), cy.clamp(0.0, screen_h.max(0.0)))
 }

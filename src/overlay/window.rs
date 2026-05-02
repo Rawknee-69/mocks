@@ -330,17 +330,22 @@ impl ApplicationHandler for OverlayApp {
         // the last perceptible "chasing" artefact.
         let fresh = self.cursor_tracker.get_position();
 
-        // Update smoothed velocity (px/s).
+        // Update smoothed velocity (px/s) with a low-pass filter.
+        // Alpha 0.15 keeps the estimate stable enough that direction changes don't
+        // produce visible overshoot. We only predict half a frame ahead: the first
+        // 0.5 frame compensates for pipeline delay; beyond that prediction noise
+        // becomes perceptible on tight curves.
         let dt = delta_seconds as f32;
         let raw_vel_x = if dt > 0.0 { (fresh.0 - self.last_mouse_pos.0) / dt } else { 0.0 };
         let raw_vel_y = if dt > 0.0 { (fresh.1 - self.last_mouse_pos.1) / dt } else { 0.0 };
-        const VELOCITY_ALPHA: f32 = 0.25;
+        const VELOCITY_ALPHA: f32 = 0.15;
+        const PREDICTION_FRAMES: f32 = 0.5;
         self.mouse_velocity.0 = self.mouse_velocity.0 + VELOCITY_ALPHA * (raw_vel_x - self.mouse_velocity.0);
         self.mouse_velocity.1 = self.mouse_velocity.1 + VELOCITY_ALPHA * (raw_vel_y - self.mouse_velocity.1);
 
-        // Predict one frame ahead and convert to window-local coords.
-        let predict_x = fresh.0 + self.mouse_velocity.0 * dt;
-        let predict_y = fresh.1 + self.mouse_velocity.1 * dt;
+        // Predict half a frame ahead and convert to window-local coords.
+        let predict_x = fresh.0 + self.mouse_velocity.0 * dt * PREDICTION_FRAMES;
+        let predict_y = fresh.1 + self.mouse_velocity.1 * dt * PREDICTION_FRAMES;
         let fresh_local = (
             fresh.0 - self.overlay_x as f32,
             fresh.1 - self.overlay_y as f32,
@@ -378,25 +383,23 @@ impl ApplicationHandler for OverlayApp {
             }
         }
 
-        // Exact frame-budget sleep: sleep for however long is left in the current
-        // frame so the loop runs at exactly the monitor refresh rate.
+        // Frame timing:
         //
-        // When idle (cursor stopped, no animation) we cap at the refresh rate to
-        // avoid burning CPU needlessly. When the frame work takes longer than one
-        // budget we skip the sleep entirely and start the next frame immediately
-        // (natural frame drop, no spiral).
-        let frame_elapsed = now.elapsed();
-        let budget = self.frame_budget;
-        if frame_elapsed < budget {
-            let remaining = budget - frame_elapsed;
-            if cursor_moved || is_animating {
-                // Precise sleep: use spin_sleep so we wake up right at the next
-                // vsync boundary even on Windows where Thread::sleep has ~15 ms
-                // granularity.
-                spin_sleep::sleep(remaining);
-            } else {
-                // Idle: coarse sleep is fine, saves CPU.
-                std::thread::sleep(remaining);
+        // On Windows, DwmFlush() (called inside render_frame) already blocks until
+        // the next DWM vsync boundary, so active frames are naturally phase-locked
+        // to the display refresh rate -- no additional sleep needed.
+        //
+        // When idle (nothing changed so render_frame was skipped), sleep one full
+        // frame budget so we don't burn CPU polling GetCursorPos at full speed.
+        if !needs_repaint || self.is_occluded {
+            std::thread::sleep(self.frame_budget);
+        }
+        // On non-Windows there is no DwmFlush, so always apply the frame budget.
+        #[cfg(not(target_os = "windows"))]
+        {
+            let frame_elapsed = now.elapsed();
+            if frame_elapsed < self.frame_budget {
+                spin_sleep::sleep(self.frame_budget - frame_elapsed);
             }
         }
     }
