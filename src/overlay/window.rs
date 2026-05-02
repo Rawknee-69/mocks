@@ -235,12 +235,7 @@ impl ApplicationHandler for OverlayApp {
         // Cursor position � winit fallback tracker gets updated via CursorMoved events.
         // The win32 tracker reads GetCursorPos directly, so update_from_window is a no-op.
         let current_mouse = self.cursor_tracker.get_position();
-        let current_mouse_local = (
-            current_mouse.0 - self.overlay_x as f32,
-            current_mouse.1 - self.overlay_y as f32,
-        );
-
-        // Send cursor position to backend periodically
+                // Send cursor position to backend periodically
         if self.frame_count % 6 == 0 {
             self.api_adapter.send(ClientMessage::CursorPosition {
                 x: current_mouse.0,
@@ -314,13 +309,22 @@ impl ApplicationHandler for OverlayApp {
             }
         }
 
-        // Cursor following
+        // Re-read cursor right before rendering -- this second sample is as close to the
+        // actual draw call as possible, minimising the visual lag between the OS cursor
+        // and our triangle. On Windows, GetCursorPos returns the hardware-reported position
+        // from the kernel input queue, not a buffered event, so it is always up to date.
+        let fresh_mouse = self.cursor_tracker.get_position();
+        let fresh_mouse_local = (
+            fresh_mouse.0 - self.overlay_x as f32,
+            fresh_mouse.1 - self.overlay_y as f32,
+        );
+
         if self.render_state.navigation_mode == CursorNavigationMode::FollowingMouse {
-            self.render_state.cursor_x = current_mouse_local.0;
-            self.render_state.cursor_y = current_mouse_local.1;
+            self.render_state.cursor_x = fresh_mouse_local.0;
+            self.render_state.cursor_y = fresh_mouse_local.1;
         }
 
-        self.render_state.update(delta_seconds, Some(current_mouse_local));
+        self.render_state.update(delta_seconds, Some(fresh_mouse_local));
 
         if !self.is_occluded {
             if let Some(renderer) = &mut self.renderer {
@@ -332,8 +336,9 @@ impl ApplicationHandler for OverlayApp {
             }
         }
 
-        // Cap to ~60fps
-        spin_sleep::sleep(Duration::from_micros(100));
+        // Cap at 240 fps (4 ms per frame). Sleeping here also yields the CPU so the OS
+        // can service new hardware mouse reports before the next GetCursorPos call.
+        spin_sleep::sleep(Duration::from_micros(4_000));
     }
 }
 
