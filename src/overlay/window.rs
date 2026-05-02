@@ -57,6 +57,8 @@ pub struct OverlayApp {
     pub simulation_mode: bool,
     pub frame_start: Instant,
     pub elapsed_secs: f64,
+    pub refresh_hz: u32,
+    pub frame_budget: std::time::Duration,
     pub last_mouse_pos: (f32, f32),
     // Exponentially smoothed mouse velocity (pixels/second) used for prediction.
     pub mouse_velocity: (f32, f32),
@@ -376,16 +378,26 @@ impl ApplicationHandler for OverlayApp {
             }
         }
 
-        // Adaptive sleep:
-        //  - When cursor is moving: no sleep -- run as fast as possible so the triangle
-        //    never lags more than one hardware report behind the OS cursor.
-        //  - When idle / no animation: sleep 16 ms (60 fps) to save CPU.
-        if cursor_moved || is_animating {
-            // Yield briefly so the OS can schedule the next mouse hardware report.
-            // 500 us is enough for a 1000 Hz mouse to deliver the next packet.
-            spin_sleep::sleep(Duration::from_micros(500));
-        } else {
-            spin_sleep::sleep(Duration::from_millis(16));
+        // Exact frame-budget sleep: sleep for however long is left in the current
+        // frame so the loop runs at exactly the monitor refresh rate.
+        //
+        // When idle (cursor stopped, no animation) we cap at the refresh rate to
+        // avoid burning CPU needlessly. When the frame work takes longer than one
+        // budget we skip the sleep entirely and start the next frame immediately
+        // (natural frame drop, no spiral).
+        let frame_elapsed = now.elapsed();
+        let budget = self.frame_budget;
+        if frame_elapsed < budget {
+            let remaining = budget - frame_elapsed;
+            if cursor_moved || is_animating {
+                // Precise sleep: use spin_sleep so we wake up right at the next
+                // vsync boundary even on Windows where Thread::sleep has ~15 ms
+                // granularity.
+                spin_sleep::sleep(remaining);
+            } else {
+                // Idle: coarse sleep is fine, saves CPU.
+                std::thread::sleep(remaining);
+            }
         }
     }
 }

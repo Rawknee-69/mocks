@@ -73,5 +73,27 @@ pub fn setup_windows_overlay(hwnd: isize) {
     log::info!("Windows overlay: WS_EX_LAYERED | WS_EX_TRANSPARENT applied, DWM glass extended");
 }
 
+/// Returns the primary monitor's current vertical refresh rate in Hz.
+/// Falls back to 60 if the query fails.
+#[cfg(target_os = "windows")]
+pub fn query_refresh_hz() -> u32 {
+    use windows_sys::Win32::Graphics::Gdi::{
+        DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
+    };
+
+    unsafe {
+        let mut dm: DEVMODEW = std::mem::zeroed();
+        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        let ok = EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut dm);
+        if ok != 0 && dm.dmDisplayFrequency >= 30 && dm.dmDisplayFrequency <= 500 {
+            log::info!("Detected monitor refresh rate: {} Hz", dm.dmDisplayFrequency);
+            return dm.dmDisplayFrequency;
+        }
+    }
+
+    log::warn!("Could not query monitor refresh rate, defaulting to 60 Hz");
+    60
+}
+
 #[cfg(not(target_os = "windows"))]
 pub fn setup_windows_overlay(_hwnd: isize) {}

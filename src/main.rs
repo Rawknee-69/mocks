@@ -147,6 +147,11 @@ fn main() {
         simulation_mode,
         frame_start: Instant::now(),
         elapsed_secs: 0.0,
+        refresh_hz: crate::platform::query_refresh_hz(),
+        frame_budget: {
+            let hz = crate::platform::query_refresh_hz();
+            std::time::Duration::from_secs_f64(1.0 / hz as f64)
+        },
         last_mouse_pos: (0.0, 0.0),
         mouse_velocity: (0.0, 0.0),
         window: None,
@@ -154,7 +159,7 @@ fn main() {
         is_occluded: false,
     };
 
-    info!("Entering winit event loop at 60fps");
+    info!("Entering winit event loop at {} Hz", app.refresh_hz);
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop.run_app(&mut app).expect("Event loop error");
 
