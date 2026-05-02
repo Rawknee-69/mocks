@@ -147,6 +147,8 @@ fn main() {
         simulation_mode,
         frame_start: Instant::now(),
         elapsed_secs: 0.0,
+        last_mouse_pos: (0.0, 0.0),
+        mouse_velocity: (0.0, 0.0),
         window: None,
         renderer: None,
         is_occluded: false,

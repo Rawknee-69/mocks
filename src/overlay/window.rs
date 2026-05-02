@@ -57,6 +57,9 @@ pub struct OverlayApp {
     pub simulation_mode: bool,
     pub frame_start: Instant,
     pub elapsed_secs: f64,
+    pub last_mouse_pos: (f32, f32),
+    // Exponentially smoothed mouse velocity (pixels/second) used for prediction.
+    pub mouse_velocity: (f32, f32),
     // winit / GPU � None until `resumed` creates the window
     pub window: Option<Arc<Window>>,
     pub renderer: Option<Renderer>,
@@ -309,24 +312,61 @@ impl ApplicationHandler for OverlayApp {
             }
         }
 
-        // Re-read cursor right before rendering -- this second sample is as close to the
-        // actual draw call as possible, minimising the visual lag between the OS cursor
-        // and our triangle. On Windows, GetCursorPos returns the hardware-reported position
-        // from the kernel input queue, not a buffered event, so it is always up to date.
-        let fresh_mouse = self.cursor_tracker.get_position();
-        let fresh_mouse_local = (
-            fresh_mouse.0 - self.overlay_x as f32,
-            fresh_mouse.1 - self.overlay_y as f32,
+        // --- Cursor sample + velocity tracking + prediction ---
+        //
+        // Sample GetCursorPos as late as possible (right before draw) so the triangle
+        // position is as fresh as the hardware can supply.
+        //
+        // Velocity is tracked with a 1-pole low-pass filter (alpha=0.2) so short
+        // acceleration spikes don't overshoot. We then predict one frame ahead:
+        //
+        //   predicted_pos = current_pos + velocity * frame_time
+        //
+        // This shifts the triangle slightly forward in the direction of travel,
+        // compensating for the ~1 frame pipeline delay between GetCursorPos and the
+        // pixels reaching the display. At 240fps that is only ~4ms, but it removes
+        // the last perceptible "chasing" artefact.
+        let fresh = self.cursor_tracker.get_position();
+
+        // Update smoothed velocity (px/s).
+        let dt = delta_seconds as f32;
+        let raw_vel_x = if dt > 0.0 { (fresh.0 - self.last_mouse_pos.0) / dt } else { 0.0 };
+        let raw_vel_y = if dt > 0.0 { (fresh.1 - self.last_mouse_pos.1) / dt } else { 0.0 };
+        const VELOCITY_ALPHA: f32 = 0.25;
+        self.mouse_velocity.0 = self.mouse_velocity.0 + VELOCITY_ALPHA * (raw_vel_x - self.mouse_velocity.0);
+        self.mouse_velocity.1 = self.mouse_velocity.1 + VELOCITY_ALPHA * (raw_vel_y - self.mouse_velocity.1);
+
+        // Predict one frame ahead and convert to window-local coords.
+        let predict_x = fresh.0 + self.mouse_velocity.0 * dt;
+        let predict_y = fresh.1 + self.mouse_velocity.1 * dt;
+        let fresh_local = (
+            fresh.0 - self.overlay_x as f32,
+            fresh.1 - self.overlay_y as f32,
+        );
+        let predicted_local = (
+            predict_x - self.overlay_x as f32,
+            predict_y - self.overlay_y as f32,
         );
 
+        let cursor_moved = (fresh.0 - self.last_mouse_pos.0).abs() > 0.5
+            || (fresh.1 - self.last_mouse_pos.1).abs() > 0.5;
+        self.last_mouse_pos = fresh;
+
+        // In FollowingMouse mode, draw at the predicted position.
+        // In all other modes, state machine owns cursor_x/cursor_y.
         if self.render_state.navigation_mode == CursorNavigationMode::FollowingMouse {
-            self.render_state.cursor_x = fresh_mouse_local.0;
-            self.render_state.cursor_y = fresh_mouse_local.1;
+            self.render_state.cursor_x = predicted_local.0;
+            self.render_state.cursor_y = predicted_local.1;
         }
 
-        self.render_state.update(delta_seconds, Some(fresh_mouse_local));
+        self.render_state.update(delta_seconds, Some(fresh_local));
 
-        if !self.is_occluded {
+        // Determine whether anything visible changed this frame.
+        let is_animating = self.render_state.navigation_mode != CursorNavigationMode::FollowingMouse
+            || self.render_state.speech_bubble_opacity > 0.0;
+        let needs_repaint = cursor_moved || is_animating;
+
+        if !self.is_occluded && needs_repaint {
             if let Some(renderer) = &mut self.renderer {
                 renderer.render_frame(
                     &self.render_state,
@@ -336,9 +376,17 @@ impl ApplicationHandler for OverlayApp {
             }
         }
 
-        // Cap at 240 fps (4 ms per frame). Sleeping here also yields the CPU so the OS
-        // can service new hardware mouse reports before the next GetCursorPos call.
-        spin_sleep::sleep(Duration::from_micros(4_000));
+        // Adaptive sleep:
+        //  - When cursor is moving: no sleep -- run as fast as possible so the triangle
+        //    never lags more than one hardware report behind the OS cursor.
+        //  - When idle / no animation: sleep 16 ms (60 fps) to save CPU.
+        if cursor_moved || is_animating {
+            // Yield briefly so the OS can schedule the next mouse hardware report.
+            // 500 us is enough for a 1000 Hz mouse to deliver the next packet.
+            spin_sleep::sleep(Duration::from_micros(500));
+        } else {
+            spin_sleep::sleep(Duration::from_millis(16));
+        }
     }
 }
 
