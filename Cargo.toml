@@ -65,10 +65,15 @@ winreg = "0.52"
 
 # ------------------------------------------------------------------
 # In debug builds, optimize all dependencies but keep the main crate
-# unoptimized for fast incremental recompilation.
+# at opt-level=1 for fast incremental recompilation while still
+# enabling basic loop/inlining optimizations.
 #
 # Without this, tiny-skia rasterizes a 1920x1080 overlay at ~54ms/frame
-# (18fps). With opt-level=2, the same work takes ~1ms (144fps capable).
+# (18fps). With opt-level=2 for deps + opt-level=1 for our code, the
+# same work takes ~1ms (144fps capable).
 # ------------------------------------------------------------------
+[profile.dev]
+opt-level = 1
+
 [profile.dev.package."*"]
 opt-level = 2

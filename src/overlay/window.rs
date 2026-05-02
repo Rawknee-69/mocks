@@ -68,6 +68,10 @@ pub struct OverlayApp {
     pub diag_flush_ms: Vec<f32>,
     pub diag_render_ms: Vec<f32>,
     pub diag_cursor_delta_px: Vec<f32>,
+    // Per-phase render breakdown (Windows only; always 0 on other platforms)
+    pub diag_paint_ms: Vec<f32>,
+    pub diag_copy_ms: Vec<f32>,
+    pub diag_ulw_ms: Vec<f32>,
     // winit / GPU � None until `resumed` creates the window
     pub window: Option<Arc<Window>>,
     pub renderer: Option<Renderer>,
@@ -394,17 +398,26 @@ impl ApplicationHandler for OverlayApp {
 
         // ---- Phase 3: render ----
         let t_render_start = Instant::now();
+        #[allow(unused_mut)]
+        let mut render_paint_ms = 0.0f32;
+        #[allow(unused_mut)]
+        let mut render_copy_ms  = 0.0f32;
+        #[allow(unused_mut)]
+        let mut render_ulw_ms   = 0.0f32;
+
         if !self.is_occluded && needs_repaint {
             if let Some(renderer) = &mut self.renderer {
                 #[cfg(target_os = "windows")]
                 {
                     use crate::overlay::windows_impl::RenderTimings;
-                    let timings: RenderTimings = renderer.render_frame(
+                    let t: RenderTimings = renderer.render_frame(
                         &self.render_state,
                         &mut self.font_system,
                         self.elapsed_secs,
                     );
-                    let _ = timings; // individual fields logged via diag accumulator
+                    render_paint_ms = t.paint_ms;
+                    render_copy_ms  = t.copy_ms;
+                    render_ulw_ms   = t.present_ms;
                 }
                 #[cfg(not(target_os = "windows"))]
                 renderer.render_frame(
@@ -422,6 +435,9 @@ impl ApplicationHandler for OverlayApp {
         self.diag_flush_ms.push(flush_ms);
         self.diag_render_ms.push(render_ms);
         self.diag_cursor_delta_px.push(cursor_delta_px);
+        self.diag_paint_ms.push(render_paint_ms);
+        self.diag_copy_ms.push(render_copy_ms);
+        self.diag_ulw_ms.push(render_ulw_ms);
 
         // ---- Emit diagnostic log once per second ----
         if now.duration_since(self.diag_last_log_at).as_secs_f32() >= 1.0 {
@@ -441,17 +457,24 @@ impl ApplicationHandler for OverlayApp {
                 let missed_frames = self.diag_frame_intervals_ms.iter()
                     .filter(|&&t| t > target_ms * 1.5)
                     .count();
+                let ap = &self.diag_paint_ms;
+                let ac = &self.diag_copy_ms;
+                let au = &self.diag_ulw_ms;
                 log::info!(
-                    "[TIMING {}/s target={:.1}ms] \
+                    "[TIMING {}/s tgt={:.1}ms] \
                      interval={:.1}/{:.1}/{:.1}ms (missed={}) \
-                     flush={:.1}/{:.1}/{:.1}ms \
-                     render={:.1}/{:.1}/{:.1}ms \
+                     flush={:.1}/{:.1}ms \
+                     paint={:.2}/{:.2}ms copy={:.2}/{:.2}ms ulw={:.2}/{:.2}ms \
+                     render_total={:.1}/{:.1}ms \
                      cursor={:.1}px/f",
                     count as u32,
                     target_ms,
                     min(fi), avg(fi), max(fi), missed_frames,
-                    min(fl), avg(fl), max(fl),
-                    min(rn), avg(rn), max(rn),
+                    min(fl), avg(fl),
+                    min(ap), avg(ap),
+                    min(ac), avg(ac),
+                    min(au), avg(au),
+                    min(rn), avg(rn),
                     avg(cd),
                 );
             }
@@ -459,14 +482,17 @@ impl ApplicationHandler for OverlayApp {
             self.diag_flush_ms.clear();
             self.diag_render_ms.clear();
             self.diag_cursor_delta_px.clear();
+            self.diag_paint_ms.clear();
+            self.diag_copy_ms.clear();
+            self.diag_ulw_ms.clear();
         }
 
         // ---- Frame pacing ----
-        // DwmFlush (called at the top of the next iteration) provides vsync pacing
-        // on Windows for active frames.  Idle frames and non-Windows use a coarse sleep.
-        if !needs_repaint || self.is_occluded {
-            std::thread::sleep(self.frame_budget);
-        }
+        // On Windows: DwmFlush() at the top of the next iteration provides vsync pacing
+        // for both active and idle frames. NO extra sleep -- adding one here would
+        // double the wait time (DwmFlush + sleep = 2 vsyncs = half the refresh rate).
+        //
+        // On non-Windows: no DwmFlush, so use frame budget timing.
         #[cfg(not(target_os = "windows"))]
         {
             let frame_elapsed = now.elapsed();
