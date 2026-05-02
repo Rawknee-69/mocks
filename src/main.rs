@@ -53,25 +53,12 @@ fn main() {
     #[cfg(not(debug_assertions))]
     let simulation_mode = false;
 
-    #[cfg(debug_assertions)]
-    let force_setup_window = std::env::var("CLICKY_FORCE_SETUP_WINDOW")
-        .map(|v| v != "0")
-        .unwrap_or(false);
-    #[cfg(not(debug_assertions))]
-    let force_setup_window = false;
-
     if simulation_mode {
         info!("SIMULATION MODE enabled — skipping real API calls");
     }
 
     if let Some(config_path) = config::config_file_path() {
         info!("Config file path: {}", config_path.display());
-    }
-
-    if force_setup_window || app_config.needs_onboarding() {
-        log::warn!("Setup incomplete — opening onboarding window");
-        panel::run_onboarding_blocking(app_config.clone());
-        app_config = config::AppConfig::load();
     }
 
     let mut audio_player = match audio::playback::AudioPlayer::new() {
@@ -85,7 +72,7 @@ fn main() {
         }
     };
 
-    let tray_icon = match tray::ClickyTrayIcon::new(app_config.needs_onboarding()) {
+    let tray_icon = match tray::ClickyTrayIcon::new() {
         Ok(tray) => {
             info!("System tray icon ready");
             Some(tray)
@@ -125,8 +112,32 @@ fn main() {
     render_state.bubble_font = renderer::load_bubble_font(&mut raylib_handle, &raylib_thread);
     let mut voice_state = VoiceState::Idle;
 
+    // Verify the backend is reachable before entering the render loop.
+    // A missing backend would previously cause an opaque panic (exit 101) deep
+    // inside the ws_task reconnect loop; this gives a clear error and exits cleanly.
+    // This check runs before tokio_rt.enter() because block_on cannot be called
+    // from within an entered runtime context.
+    let backend_url = format!("ws://127.0.0.1:{}", BACKEND_PORT);
+    match tokio_rt.block_on(tokio_tungstenite::connect_async(&backend_url)) {
+        Ok(_) => {
+            info!("Backend reachable at {}", backend_url);
+        }
+        Err(err) => {
+            log::error!(
+                "Cannot connect to backend at {} — is `cargo run -p clicky-backend` running? ({})",
+                backend_url,
+                err
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // Enter the tokio runtime for the remainder of main so that tokio::spawn
+    // and spawn_blocking calls from the synchronous render loop work correctly.
+    let _tokio_guard = tokio_rt.enter();
+
     // Connect the WebSocket adapter — must be done inside the tokio runtime
-    let api_adapter = tokio_rt.block_on(async { ApiAdapter::connect(BACKEND_PORT) });
+    let api_adapter = ApiAdapter::connect(BACKEND_PORT);
     info!("ApiAdapter connected to backend on port {}", BACKEND_PORT);
 
     info!("Entering main render loop at 60fps");
@@ -176,10 +187,7 @@ fn main() {
                     TrayMenuEvent::OpenSettings => {
                         info!("Open settings requested");
                         let latest_config = config::AppConfig::load();
-                        panel::open_settings_window(
-                            latest_config.clone(),
-                            latest_config.needs_onboarding(),
-                        );
+                        panel::open_settings_window(latest_config.clone());
                     }
                 }
             }
@@ -216,7 +224,7 @@ fn main() {
 
                                     // Bridge audio chunks to the backend via the adapter
                                     let adapter_audio_tx = api_adapter.client_tx_clone();
-                                    tokio_rt.spawn(tokio::task::spawn_blocking(move || {
+                                    tokio_rt.spawn_blocking(move || {
                                         while let Ok(chunk) = audio_rx.recv() {
                                             let pcm16 = crate::core::pcm16_converter::convert_float32_to_pcm16_mono(
                                                 &chunk.samples,
@@ -230,7 +238,7 @@ fn main() {
                                                 break;
                                             }
                                         }
-                                    }));
+                                    });
                                 }
                                 Err(err) => {
                                     log::error!("Mic capture failed: {}", err);
@@ -279,7 +287,7 @@ fn main() {
                             let cursor_pos = cursor_tracker.get_position();
                             let platform_clone = platform.clone();
                             let adapter_tx = api_adapter.client_tx_clone();
-                            tokio_rt.spawn(tokio::task::spawn_blocking(move || {
+                            tokio_rt.spawn_blocking(move || {
                                 match screenshot::capture_all_screens(
                                     cursor_pos.0,
                                     cursor_pos.1,
@@ -295,7 +303,7 @@ fn main() {
                                         log::error!("Screenshot capture failed: {}", err);
                                     }
                                 }
-                            }));
+                            });
 
                             if let Some(new_state) =
                                 voice_state.apply(VoiceStateTransition::HotkeyReleased)

@@ -2,9 +2,11 @@
 ///
 /// Microphone input arrives at 44100Hz or 48000Hz float32. AssemblyAI requires
 /// 16000Hz signed 16-bit little-endian mono PCM.
+#[allow(dead_code)]
 pub const TARGET_SAMPLE_RATE: u32 = 16000;
 
 /// Converts float32 audio samples at an arbitrary rate to PCM16 mono at 16kHz.
+#[allow(dead_code)]
 pub fn convert_float32_to_pcm16_mono(
     input_samples: &[f32],
     input_sample_rate: u32,

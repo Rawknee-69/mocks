@@ -142,3 +142,51 @@ Note: the current repo `Cargo.toml` may still be on older settings. Follow the r
 - Phase 4 complete: ElevenLabs TTS, playback, fallback behavior, lifecycle integration.
 - Phase 5 complete: cursor animation polish, return flight, bubble styling, font, loading animation.
 - Phase 6 in progress: packaging, release docs, and CI.
+
+## Workspace Structure (Cargo Workspace)
+
+This is a **Cargo workspace** with three crates at the repo root:
+
+- `.` (`clicky-desktop`) — the frontend: Raylib overlay, tray, hotkey, audio capture, egui settings, screenshot capture.
+- `backend/` (`clicky-backend`) — the backend pipeline server: AssemblyAI, Claude vision, Claude Computer Use, ElevenLabs TTS, error handling, structured logging.
+- `clicky-types/` — shared WebSocket message types (`ClientMessage`, `ServerMessage`, `ScreenshotData`, `DisplayInfo`, `ErrorCode`, `PointingInstruction`) used by both crates.
+
+Root `Cargo.toml` declares `members = [".", "backend", "clicky-types"]`.
+
+## Frontend ↔ Backend Communication
+
+- Protocol: **WebSocket on `ws://127.0.0.1:9001`** (port constant `BACKEND_PORT = 9001` in `src/api/adapter.rs`).
+- Frontend sends `ClientMessage` JSON frames; backend replies with `ServerMessage` JSON frames.
+- `src/api/adapter.rs` — `ApiAdapter` struct: non-blocking bridge between the 60fps Raylib render loop and the backend WS task. Auto-reconnects with exponential back-off.
+- Frontend captures screenshots and sends them to the backend via `ClientMessage::Screenshots`; the backend owns all API calls (AssemblyAI, Claude, ElevenLabs).
+- All API keys and environment variables live **only in the backend** `.env`; the frontend never reads `.env`.
+
+## Build And Run (Updated)
+
+Run both processes; each in its own terminal:
+
+```bash
+# Terminal 1 – backend pipeline server
+cargo run -p clicky-backend
+
+# Terminal 2 – frontend desktop overlay
+cargo run -p clicky-desktop
+```
+
+Backend `.env` (at `backend/.env`): `ASSEMBLYAI_API_KEY`, `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `LOG_LEVEL=debug`, `PORT=9001`.
+
+## Learned User Preferences
+
+- User prefers the backend to own all API keys and env vars; the frontend must never read `.env` or API keys.
+- User requires full type safety — no type casting allowed anywhere in the codebase.
+- User wants the backend to only process data; screenshots must be captured by the frontend and sent to the backend, not captured server-side.
+- When presenting architectural options, explain first and ask which approach to implement before building.
+
+## Learned Workspace Facts
+
+- `clicky-types` crate is the single source of truth for all shared WS message types; never duplicate these types in frontend or backend.
+- `backend/src/error.rs` and `backend/src/logger.rs` implement centralised error handling and structured logging (log level controlled via `LOG_LEVEL` env var; off in prod).
+- `src/api/adapter.rs` is the only file in the frontend that knows about the WebSocket connection; all other frontend code communicates through `UiEvent` as before.
+- Windows build requires CMake (`winget install Kitware.CMake`) and LLVM (`winget install LLVM.LLVM`) with `LIBCLANG_PATH=C:\Program Files\LLVM\bin` set; `raylib-sys` and `bindgen` need these at build time.
+- The Tokio render-loop pattern: call `let _tokio_guard = tokio_rt.enter()` before `ApiAdapter::connect` so all `tokio::spawn` / `spawn_blocking` calls in the synchronous 60fps render loop work without "no reactor running" panics.
+- Windows transparent overlay correctness: keep `WS_EX_LAYERED` (required for GLFW transparent framebuffer compositing), add `WS_EX_TRANSPARENT` for click-through, never call `SetLayeredWindowAttributes`, and do NOT set `FLAG_WINDOW_MOUSE_PASSTHROUGH` in Raylib (it calls `SetLayeredWindowAttributes` internally and breaks per-pixel alpha).

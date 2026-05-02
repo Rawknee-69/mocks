@@ -45,7 +45,6 @@ pub enum VoiceStateTransition {
 pub struct PointingInstruction {
     pub screenshot_x: f64,
     pub screenshot_y: f64,
-    pub label: String,
     pub screen_number: Option<u32>,
 }
 

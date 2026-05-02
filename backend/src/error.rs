@@ -17,6 +17,7 @@ pub enum AppError {
     #[error("ElevenLabs TTS error: {0}")]
     ElevenLabs(String),
 
+    #[allow(dead_code)]
     #[error("Computer Use API error: {0}")]
     ComputerUse(String),
 
@@ -32,6 +33,7 @@ pub enum AppError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[allow(dead_code)]
     #[error("Internal error: {0}")]
     Internal(String),
 }

@@ -827,10 +827,17 @@ pub fn create_overlay_window(
         .build();
 
     unsafe {
-        raylib::ffi::SetWindowState(
-            raylib::ffi::ConfigFlags::FLAG_WINDOW_TOPMOST as u32
-                | raylib::ffi::ConfigFlags::FLAG_WINDOW_MOUSE_PASSTHROUGH as u32,
-        );
+        // FLAG_WINDOW_TOPMOST keeps us on top. FLAG_WINDOW_ALWAYS_RUN (0x00000100) keeps
+        // the Raylib render loop ticking even when the window loses focus — without it the
+        // OpenGL context pauses on alt-tab, leaving the overlay black until focus returns.
+        //
+        // FLAG_WINDOW_MOUSE_PASSTHROUGH is intentionally NOT set here: on Windows it calls
+        // SetLayeredWindowAttributes which switches DWM out of per-pixel compositing mode,
+        // turning the BLANK-cleared framebuffer opaque black.  Click-through is handled
+        // via WS_EX_TRANSPARENT in configure_windows_overlay_window instead.
+        let flags = raylib::ffi::ConfigFlags::FLAG_WINDOW_TOPMOST as u32
+            | 0x00000100; // FLAG_WINDOW_ALWAYS_RUN
+        raylib::ffi::SetWindowState(flags);
         raylib::ffi::SetWindowPosition(window_x, window_y);
     }
 
@@ -853,12 +860,17 @@ fn configure_windows_overlay_window(
     window_height: i32,
 ) {
     use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Graphics::Dwm::{DwmExtendFrameIntoClientArea, DwmSetWindowAttribute};
+    use windows_sys::Win32::UI::Controls::MARGINS;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-        GWL_EXSTYLE, HWND_TOPMOST, LWA_ALPHA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
-        SWP_NOACTIVATE, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-        WS_EX_TRANSPARENT,
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOPMOST,
+        SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, WS_EX_APPWINDOW, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     };
+    // DWMWINDOWATTRIBUTE values — using numeric literals because windows-sys 0.59
+    // does not export DWMWA_DISALLOW_PEEK / DWMWA_EXCLUDED_FROM_PEEK as named constants.
+    const DWMWA_DISALLOW_PEEK: u32 = 11;
+    const DWMWA_EXCLUDED_FROM_PEEK: u32 = 12;
 
     let glfw_window = unsafe { raylib::ffi::GetWindowHandle() };
     if glfw_window.is_null() {
@@ -873,18 +885,25 @@ fn configure_windows_overlay_window(
     }
 
     unsafe {
-        ShowWindow(hwnd, SW_HIDE);
-
         let current_ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+
+        // Raylib's .transparent() uses GLFW_TRANSPARENT_FRAMEBUFFER which tells DWM to
+        // composite the OpenGL framebuffer using its own per-pixel alpha channel.  This
+        // path works correctly without WS_EX_LAYERED — in fact, adding WS_EX_LAYERED
+        // post-creation breaks it by switching DWM into the legacy layered blit path.
+        //
+        // WS_EX_TRANSPARENT alone gives click-through on a non-layered window by routing
+        // hit-tests to the window behind.  It does not touch the compositing path at all.
+        //
+        // WS_EX_APPWINDOW is stripped, WS_EX_TOOLWINDOW is set: together they hide the
+        // overlay from the taskbar and the Alt+Tab switcher.
         let updated_ex_style = (current_ex_style
-            | WS_EX_LAYERED
             | WS_EX_TRANSPARENT
             | WS_EX_TOOLWINDOW
             | WS_EX_NOACTIVATE)
-            & !WS_EX_APPWINDOW;
+            & !WS_EX_APPWINDOW
+            & !WS_EX_LAYERED;
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, updated_ex_style as isize);
-
-        let _ = SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
 
         let _ = SetWindowPos(
             hwnd,
@@ -896,9 +915,37 @@ fn configure_windows_overlay_window(
             SWP_FRAMECHANGED | SWP_NOACTIVATE,
         );
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
+        // DWM "sheet of glass" — extend the DWM frame to cover the entire client area
+        // with all-(-1) margins.  This forces DWM to keep its redirection surface alive
+        // and composite via the per-pixel alpha path on Intel iGPUs that otherwise black-
+        // flash when the window is first shown or when PrtScn triggers a DWM snapshot.
+        let margins = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+
+        // Prevent DWM from including this overlay in Aero Peek / thumbnail previews,
+        // which can cause a brief black-flash when the peek animation fires.
+        let true_value: u32 = 1;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_DISALLOW_PEEK,
+            std::ptr::addr_of!(true_value).cast(),
+            std::mem::size_of::<u32>() as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_EXCLUDED_FROM_PEEK,
+            std::ptr::addr_of!(true_value).cast(),
+            std::mem::size_of::<u32>() as u32,
+        );
     }
 
-    log::info!("Windows overlay: applied toolwindow/noactivate/transparent styles");
+    log::info!("Windows overlay: applied transparent/toolwindow/noactivate styles and DWM sheet-of-glass");
 }
 
 #[cfg(target_os = "linux")]

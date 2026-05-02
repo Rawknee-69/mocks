@@ -13,6 +13,7 @@ pub struct PointingParseResult {
 pub struct ParsedPointingCoordinate {
     pub screenshot_pixel_x: f64,
     pub screenshot_pixel_y: f64,
+    #[allow(dead_code)]
     pub element_label: String,
     pub screen_number: Option<u32>,
 }

@@ -330,6 +330,7 @@ fn capture_with_grim(cursor_x: f32, cursor_y: f32) -> Result<CaptureResult, Scre
 
 /// Queries the primary monitor's dimensions for overlay window sizing.
 /// Falls back to 1920x1080 if detection fails.
+#[allow(dead_code)]
 pub fn detect_screen_size(platform: &PlatformInfo) -> (i32, i32) {
     let (_, _, width, height) = detect_overlay_bounds(platform);
     (width, height)

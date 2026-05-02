@@ -5,10 +5,12 @@ use std::fs;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::path::PathBuf;
 
+#[allow(dead_code)]
 pub fn is_supported() -> bool {
     cfg!(target_os = "linux") || cfg!(target_os = "windows")
 }
 
+#[allow(dead_code)]
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
     if !is_supported() {
         let _ = enabled;
@@ -57,6 +59,7 @@ fn set_enabled_linux(enabled: bool, executable_path: &PathBuf) -> Result<(), Str
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn set_enabled_windows(enabled: bool, executable_path: &PathBuf) -> Result<(), String> {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
