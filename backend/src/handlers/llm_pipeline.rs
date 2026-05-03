@@ -1,7 +1,7 @@
-/// LLM pipeline handler — OpenRouter vision + Computer Use + TTS.
+/// LLM pipeline handler — vision + Computer Use + TTS.
 ///
 /// Screenshots arrive from the frontend over WebSocket. The backend no longer captures them.
-use crate::api::{computer_use, openrouter};
+use crate::api::{self, computer_use, gemini, openrouter, Provider};
 use crate::core::{coordinate_mapper, point_parser};
 use crate::error::AppError;
 use crate::handlers::tts;
@@ -12,18 +12,19 @@ use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
 
 pub struct LlmPipelineConfig {
-    pub openrouter_api_key: String,
+    pub llm_provider: Arc<api::Provider>,
+    pub cu_provider: Arc<api::Provider>,
     pub deepgram_api_key: Option<String>,
     pub deepgram_tts_voice: Option<String>,
     pub tts_enabled: bool,
-    /// Shared 20-permit semaphore enforcing the OpenRouter RPM cap.
+    /// Shared semaphore enforcing the AI provider RPM cap.
     pub llm_rate_limiter: Arc<Semaphore>,
 }
 
 /// Runs the full LLM pipeline for a completed transcript.
 ///
 /// 1. Uses screenshots provided by the frontend.
-/// 2. Calls OpenRouter vision API (streaming, Nemotron Omni).
+/// 2. Calls the configured LLM provider (OpenRouter or Gemini) via streaming.
 /// 3. Parses POINT tag from response.
 /// 4. Sends `ServerMessage::LlmResponse` immediately (coordinate = POINT fallback or None).
 /// 5. Spawns Deepgram TTS in parallel.
@@ -56,22 +57,44 @@ pub async fn run_llm_pipeline(
         messages.push(serde_json::json!({"role": "assistant", "content": assistant_text}));
     }
 
-    let user_content = openrouter::build_vision_message_content(&transcript, &screenshots);
+    let user_content = match config.llm_provider.as_ref() {
+        Provider::OpenRouter { .. } => {
+            openrouter::build_vision_message_content(&transcript, &screenshots)
+        }
+        Provider::Gemini { .. } => {
+            gemini::build_vision_message_content(&transcript, &screenshots)
+        }
+    };
     messages.push(serde_json::json!({"role": "user", "content": user_content}));
 
-    let model = openrouter::DEFAULT_OPENROUTER_MODEL;
-    info!("sending to OpenRouter ({model})...");
-
-    let result = openrouter::stream_llm_response(
-        &http_client,
-        &config.openrouter_api_key,
-        model,
-        openrouter::COMPANION_VOICE_RESPONSE_SYSTEM_PROMPT,
-        messages,
-        Arc::clone(&config.llm_rate_limiter),
-        |_chunk| {},
-    )
-    .await;
+    let result = match config.llm_provider.as_ref() {
+        Provider::OpenRouter { api_key, model } => {
+            info!("sending to OpenRouter ({model})...");
+            openrouter::stream_llm_response(
+                &http_client,
+                api_key,
+                model,
+                openrouter::COMPANION_VOICE_RESPONSE_SYSTEM_PROMPT,
+                messages,
+                Arc::clone(&config.llm_rate_limiter),
+                |_chunk| {},
+            )
+            .await
+        }
+        Provider::Gemini { api_key, model } => {
+            info!("sending to Gemini ({model})...");
+            gemini::stream_llm_response(
+                &http_client,
+                api_key,
+                model,
+                openrouter::COMPANION_VOICE_RESPONSE_SYSTEM_PROMPT,
+                messages,
+                Arc::clone(&config.llm_rate_limiter),
+                |_chunk| {},
+            )
+            .await
+        }
+    };
 
     let response_text = match result {
         Ok(text) => text,
@@ -140,7 +163,7 @@ pub async fn run_llm_pipeline(
         let cu_client = http_client.clone();
         let cu_screenshots = screenshots.clone();
         let cu_display_infos = display_infos.clone();
-        let cu_api_key = config.openrouter_api_key.clone();
+        let cu_provider = Arc::clone(&config.cu_provider);
         let cu_transcript = transcript.clone();
         let cu_rate_limiter = Arc::clone(&config.llm_rate_limiter);
         let cu_tx = server_tx.clone();
@@ -150,7 +173,7 @@ pub async fn run_llm_pipeline(
                 &cu_client,
                 &cu_screenshots,
                 &cu_display_infos,
-                &cu_api_key,
+                cu_provider,
                 &cu_transcript,
                 cu_rate_limiter,
             )
@@ -170,7 +193,7 @@ async fn detect_computer_use_coordinate(
     http_client: &reqwest::Client,
     screenshots: &[ScreenshotData],
     display_infos: &[DisplayInfo],
-    openrouter_api_key: &str,
+    cu_provider: Arc<Provider>,
     transcript: &str,
     rate_limiter: Arc<Semaphore>,
 ) -> Option<(f64, f64)> {
@@ -185,7 +208,7 @@ async fn detect_computer_use_coordinate(
 
     let coordinate = computer_use::detect_element_location(
         http_client,
-        openrouter_api_key,
+        cu_provider,
         &cursor_screenshot.jpeg_data,
         transcript,
         cursor_display.display_width_points,

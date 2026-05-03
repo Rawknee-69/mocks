@@ -5,6 +5,7 @@
 /// One connection at a time: a new WebSocket connection resets all pipeline state.
 /// The previous connection's tasks are not explicitly cancelled but will fail
 /// when they try to send on the closed channel.
+use crate::api::{self, computer_use, openrouter, Provider};
 use crate::core::context_compactor;
 use crate::error::AppError;
 use crate::handlers::{llm_pipeline, transcription};
@@ -21,8 +22,8 @@ use tokio_tungstenite::{
 };
 use tracing::{error, info, warn};
 
-/// OpenRouter RPM cap. One permit is consumed per LLM or Computer Use request.
-const OPENROUTER_RPM_CAP: usize = 20;
+/// RPM cap. One permit is consumed per LLM or Computer Use request.
+const RPM_CAP: usize = 20;
 /// Deepgram concurrent TTS streams cap.
 const DEEPGRAM_TTS_CONCURRENT_CAP: usize = 45;
 
@@ -32,8 +33,41 @@ pub async fn run(port: u16) {
     let listener = TcpListener::bind(addr).await.expect("failed to bind port");
     info!("WebSocket server listening on ws://{addr}");
 
+    // Build providers once at startup — env vars are read a single time here.
+    let ai_provider_str = std::env::var("AI_PROVIDER").unwrap_or_else(|_| "openrouter".into());
+    let gemini_api_key = std::env::var("GEMINI_API_KEY").ok();
+    let openrouter_api_key = std::env::var("OPENROUTER_API_KEY").ok();
+    let llm_model = std::env::var("LLM_MODEL").ok();
+    let cu_model = std::env::var("CU_MODEL").ok();
+
+    let llm_provider: Arc<Provider> = Arc::new(build_provider(
+        &ai_provider_str,
+        gemini_api_key.clone(),
+        openrouter_api_key.clone(),
+        llm_model,
+        openrouter::DEFAULT_OPENROUTER_MODEL,
+        "gemini-2.0-flash",
+    ));
+
+    let cu_provider: Arc<Provider> = Arc::new(build_provider(
+        &ai_provider_str,
+        gemini_api_key.clone(),
+        openrouter_api_key.clone(),
+        cu_model,
+        computer_use::DEFAULT_CU_MODEL,
+        "gemini-2.0-flash",
+    ));
+
+    // Fail fast with a clear message rather than silently using an empty key.
+    if matches!(&*llm_provider, Provider::Gemini { api_key, .. } if api_key.is_empty()) {
+        panic!("AI_PROVIDER=gemini requires GEMINI_API_KEY to be set");
+    }
+    if matches!(&*llm_provider, Provider::OpenRouter { api_key, .. } if api_key.is_empty()) {
+        warn!("AI_PROVIDER=openrouter but OPENROUTER_API_KEY is empty — requests will fail");
+    }
+
     // Global semaphores shared across all concurrent connections
-    let llm_rate_limiter: Arc<Semaphore> = Arc::new(Semaphore::new(OPENROUTER_RPM_CAP));
+    let llm_rate_limiter: Arc<Semaphore> = Arc::new(Semaphore::new(RPM_CAP));
     let tts_rate_limiter: Arc<Semaphore> = Arc::new(Semaphore::new(DEEPGRAM_TTS_CONCURRENT_CAP));
 
     loop {
@@ -44,6 +78,8 @@ pub async fn run(port: u16) {
                     stream,
                     Arc::clone(&llm_rate_limiter),
                     Arc::clone(&tts_rate_limiter),
+                    Arc::clone(&llm_provider),
+                    Arc::clone(&cu_provider),
                 ));
             }
             Err(err) => {
@@ -53,11 +89,37 @@ pub async fn run(port: u16) {
     }
 }
 
+/// Constructs a `Provider` from env var values.
+///
+/// Centralises all `match`-on-string logic so no other function needs to know
+/// about the string names of providers.
+fn build_provider(
+    provider_name: &str,
+    gemini_api_key: Option<String>,
+    openrouter_api_key: Option<String>,
+    model_override: Option<String>,
+    openrouter_default_model: &str,
+    gemini_default_model: &str,
+) -> Provider {
+    match provider_name.to_ascii_lowercase().as_str() {
+        "gemini" => Provider::Gemini {
+            api_key: gemini_api_key.unwrap_or_default(),
+            model: model_override.unwrap_or_else(|| gemini_default_model.to_string()),
+        },
+        _ => Provider::OpenRouter {
+            api_key: openrouter_api_key.unwrap_or_default(),
+            model: model_override.unwrap_or_else(|| openrouter_default_model.to_string()),
+        },
+    }
+}
+
 /// Handles a single WebSocket connection end-to-end.
 async fn handle_connection(
     tcp_stream: TcpStream,
     llm_rate_limiter: Arc<Semaphore>,
     _tts_rate_limiter: Arc<Semaphore>,
+    llm_provider: Arc<api::Provider>,
+    cu_provider: Arc<api::Provider>,
 ) {
     let ws_config = WebSocketConfig::default()
         .max_message_size(Some(32 * 1024 * 1024))
@@ -76,11 +138,9 @@ async fn handle_connection(
     let (server_tx, server_rx) = mpsc::channel::<ServerMessage>(64);
     let forwarder_handle = tokio::spawn(forward_to_websocket(server_rx, ws_sink));
 
-    // Load API keys from environment once per connection
+    // Load Deepgram API key and TTS settings from environment
     let deepgram_key = std::env::var("DEEPGRAM_API_KEY").ok();
-    let openrouter_key = std::env::var("OPENROUTER_API_KEY").ok();
     let deepgram_tts_voice = std::env::var("DEEPGRAM_TTS_VOICE").ok();
-    // TTS is enabled whenever a Deepgram key is present (same key for STT and TTS)
     let tts_enabled = deepgram_key.is_some();
 
     let http_client = reqwest::Client::new();
@@ -161,34 +221,43 @@ async fn handle_connection(
                         Some(transcript.clone())
                     };
 
-                    if !transcript.is_empty() {
-                        if let Some(ref or_key) = openrouter_key {
-                            // Compact history before passing it to the pipeline
-                            context_compactor::maybe_compact(
-                                &mut conversation_history,
-                                &http_client,
-                                or_key,
-                                Arc::clone(&llm_rate_limiter),
+                    if transcript.is_empty() {
+                        // Nothing was said (silence or mic not captured) — tell the
+                        // frontend to return to Idle so it doesn't stay frozen.
+                        warn!("empty transcript received — sending abort to frontend");
+                        let _ = relay_tx
+                            .send(
+                                AppError::Transcription("no speech detected".into())
+                                    .into_server_message(),
                             )
                             .await;
+                    } else {
+                        // Compact history before passing it to the pipeline
+                        context_compactor::maybe_compact(
+                            &mut conversation_history,
+                            &http_client,
+                            &llm_provider,
+                            Arc::clone(&llm_rate_limiter),
+                        )
+                        .await;
 
-                            let config = llm_pipeline::LlmPipelineConfig {
-                                openrouter_api_key: or_key.clone(),
-                                deepgram_api_key: deepgram_key.clone(),
-                                deepgram_tts_voice: deepgram_tts_voice.clone(),
-                                tts_enabled,
-                                llm_rate_limiter: Arc::clone(&llm_rate_limiter),
-                            };
-                            let client = http_client.clone();
-                            let tx = pipeline_tx.clone();
-                            let history: Vec<(String, String)> =
-                                conversation_history.iter().cloned().collect();
-                            let (screenshots, display_infos) =
-                                pending_screenshots.take().unwrap_or_default();
-                            tokio::spawn(llm_pipeline::run_llm_pipeline(
-                                client, config, transcript, screenshots, display_infos, history, tx,
-                            ));
-                        }
+                        let config = llm_pipeline::LlmPipelineConfig {
+                            llm_provider: Arc::clone(&llm_provider),
+                            cu_provider: Arc::clone(&cu_provider),
+                            deepgram_api_key: deepgram_key.clone(),
+                            deepgram_tts_voice: deepgram_tts_voice.clone(),
+                            tts_enabled,
+                            llm_rate_limiter: Arc::clone(&llm_rate_limiter),
+                        };
+                        let client = http_client.clone();
+                        let tx = pipeline_tx.clone();
+                        let history: Vec<(String, String)> =
+                            conversation_history.iter().cloned().collect();
+                        let (screenshots, display_infos) =
+                            pending_screenshots.take().unwrap_or_default();
+                        tokio::spawn(llm_pipeline::run_llm_pipeline(
+                            client, config, transcript, screenshots, display_infos, history, tx,
+                        ));
                     }
                 }
 

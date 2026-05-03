@@ -19,6 +19,7 @@
 //!   computed scale, then independently rounded. The inverse uses the rounded
 //!   dims, so there is zero compounding error.
 
+use crate::api::Provider;
 use std::{io::Cursor, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -32,8 +33,9 @@ use tracing::{debug, info, warn};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const MODEL: &str = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
-const API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+pub const DEFAULT_CU_MODEL: &str = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
+const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
 /// Longest edge of images sent to the model.  1 920 px is enough detail for
 /// element detection while keeping payloads reasonable.
@@ -192,7 +194,7 @@ struct CoordJson {
 /// - The screenshot could not be decoded.
 pub async fn detect_element_location(
     http_client: &Client,
-    api_key: &str,
+    provider: Arc<Provider>,
     screenshot_jpeg: &[u8],
     user_question: &str,
     display_width_points: f64,
@@ -213,7 +215,7 @@ pub async fn detect_element_location(
     // Pass 1 is mandatory — if it fails we have nothing.
     let (raw1_x, raw1_y) = call_with_retry(
         http_client,
-        api_key,
+        &provider,
         &full_jpeg,
         user_question,
         full_dims,
@@ -227,6 +229,23 @@ pub async fn detect_element_location(
         full_dims.unproject(mx1, my1, display_width_points, display_height_points);
 
     info!("ComputerUse pass 1 → ({coarse_dx:.1}, {coarse_dy:.1}) display pts");
+
+    // Centre-hallucination guard: free-tier LLMs sometimes return the exact screen
+    // centre when they are unsure rather than null.  Treat this as a detection failure.
+    {
+        let centre_x = display_width_points / 2.0;
+        let centre_y = display_height_points / 2.0;
+        let tolerance_x = display_width_points * 0.05;
+        let tolerance_y = display_height_points * 0.05;
+        if (coarse_dx - centre_x).abs() < tolerance_x && (coarse_dy - centre_y).abs() < tolerance_y
+        {
+            warn!(
+                "ComputerUse: pass-1 result ({coarse_dx:.1}, {coarse_dy:.1}) is within 5% of \
+                 screen centre — treating as hallucination, aborting"
+            );
+            return None;
+        }
+    }
 
     // ── Pass 2: fine location in a 4× zoom crop ───────────────────────────
 
@@ -274,7 +293,7 @@ pub async fn detect_element_location(
     // Pass 2 failure falls back to pass 1 — never lose the coarse result.
     let (final_dx, final_dy) = match call_with_retry(
         http_client,
-        api_key,
+        &provider,
         &zoom_jpeg,
         &pass2_question,
         zoom_dims,
@@ -425,6 +444,9 @@ fn encode_jpeg(img: &image::RgbImage) -> Option<Vec<u8>> {
 /// Heuristic: if both values are in [0, 1] and at least one is non-integer
 /// (ruling out real pixel coordinates 0 and 1 on a non-trivial display), treat
 /// them as normalised.
+///
+/// Also handles 0-1000 scale (Gemini native bounding boxes): if both values fit
+/// in [0, 1000] and the display is wider than 1000 px, treat as 0-1000 normalised.
 fn denormalise_if_needed(x: f64, y: f64, dims: ModelDims) -> (f64, f64) {
     let both_in_unit = (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y);
     // Integer coords ≤ 1 on a real display are genuine pixel addresses, not
@@ -439,6 +461,18 @@ fn denormalise_if_needed(x: f64, y: f64, dims: ModelDims) -> (f64, f64) {
         );
         return (x * dims.width as f64, y * dims.height as f64);
     }
+
+    // Gemini sometimes returns bounding-box coords in the 0-1000 range.
+    let both_under_1000 = (0.0..=1000.0).contains(&x) && (0.0..=1000.0).contains(&y);
+    let are_pixel_coords = x > 1.0 || y > 1.0; // at least one axis non-trivially > 1
+    if both_under_1000 && are_pixel_coords && dims.width > 1000 {
+        info!(
+            "ComputerUse: 0-1000 coords ({x:.1}, {y:.1}) → scaling to {}×{}",
+            dims.width, dims.height,
+        );
+        return (x / 1000.0 * dims.width as f64, y / 1000.0 * dims.height as f64);
+    }
+
     (x, y)
 }
 
@@ -454,7 +488,7 @@ fn clamp_to_dims(x: f64, y: f64, dims: ModelDims) -> (f64, f64) {
 
 async fn call_with_retry(
     client: &Client,
-    api_key: &str,
+    provider: &Provider,
     jpeg: &[u8],
     question: &str,
     dims: ModelDims,
@@ -469,7 +503,7 @@ async fn call_with_retry(
         }
 
         if let Some(c) =
-            call_once(client, api_key, jpeg, question, dims, Arc::clone(&rate_limiter)).await
+            call_once(client, provider, jpeg, question, dims, Arc::clone(&rate_limiter)).await
         {
             return Some(c);
         }
@@ -494,7 +528,26 @@ fn subsec_jitter_ms(max_ms: u64) -> u64 {
 
 async fn call_once(
     client: &Client,
+    provider: &Provider,
+    jpeg: &[u8],
+    question: &str,
+    dims: ModelDims,
+    rate_limiter: Arc<Semaphore>,
+) -> Option<(f64, f64)> {
+    match provider {
+        Provider::OpenRouter { api_key, model } => {
+            call_once_openrouter(client, api_key, model, jpeg, question, dims, rate_limiter).await
+        }
+        Provider::Gemini { api_key, model } => {
+            call_once_gemini(client, api_key, model, jpeg, question, dims, rate_limiter).await
+        }
+    }
+}
+
+async fn call_once_openrouter(
+    client: &Client,
     api_key: &str,
+    model: &str,
     jpeg: &[u8],
     question: &str,
     dims: ModelDims,
@@ -504,11 +557,8 @@ async fn call_once(
     let prompt = build_prompt(question, dims.width, dims.height);
 
     let body = json!({
-        "model": MODEL,
-        // 128 tokens is enough for the coordinate JSON.
-        // A low cap discourages the model from appending prose after the JSON.
-        "max_tokens": 128,
-        // Zero temperature: deterministic, no creative coordinate "hallucination".
+        "model": model,
+        "max_tokens": 512,
         "temperature": 0,
         "messages": [{
             "role": "user",
@@ -531,7 +581,7 @@ async fn call_once(
         .ok()?;
 
     let resp = client
-        .post(API_URL)
+        .post(OPENROUTER_API_URL)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .timeout(REQUEST_TIMEOUT)
@@ -583,6 +633,88 @@ async fn call_once(
     }
 
     debug!("ComputerUse raw: {raw}");
+    parse_coordinate(&raw)
+}
+
+async fn call_once_gemini(
+    client: &Client,
+    api_key: &str,
+    model: &str,
+    jpeg: &[u8],
+    question: &str,
+    dims: ModelDims,
+    rate_limiter: Arc<Semaphore>,
+) -> Option<(f64, f64)> {
+    let b64 = STANDARD.encode(jpeg);
+    let prompt = build_prompt(question, dims.width, dims.height);
+    let url = format!("{GEMINI_API_BASE}/{model}:generateContent?key={api_key}");
+
+    let body = json!({
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {
+                    "inlineData": {
+                        "mimeType": "image/jpeg",
+                        "data": b64
+                    }
+                },
+                { "text": prompt }
+            ]
+        }],
+        "generationConfig": {
+            "maxOutputTokens": 512,
+            "temperature": 0.0
+        }
+    });
+
+    let _permit = rate_limiter
+        .acquire()
+        .await
+        .map_err(|_| warn!("ComputerUse: semaphore closed"))
+        .ok()?;
+
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .timeout(REQUEST_TIMEOUT)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| warn!("ComputerUse (Gemini): network error: {e}"))
+        .ok()?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        warn!(
+            "ComputerUse (Gemini): HTTP {status} — {}",
+            &text[..text.len().min(300)]
+        );
+        return None;
+    }
+
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| warn!("ComputerUse (Gemini): response JSON: {e}"))
+        .ok()?;
+
+    let raw = json["candidates"][0]["content"]["parts"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+
+    if raw.is_empty() {
+        warn!(
+            "ComputerUse (Gemini): empty content — full response: {}",
+            json["candidates"][0]["content"]
+        );
+        return None;
+    }
+
+    debug!("ComputerUse (Gemini) raw: {raw}");
     parse_coordinate(&raw)
 }
 
