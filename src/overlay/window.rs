@@ -57,6 +57,8 @@ pub struct OverlayApp {
     pub pointing_hold_since: Option<Instant>,
     pub last_config_poll_at: Instant,
     pub last_config_modified_at: Option<std::time::SystemTime>,
+    pub cu_coordinate_pending: bool,
+    pub cu_pending_since: Option<Instant>,
     pub simulation_mode: bool,
     pub frame_start: Instant,
     pub elapsed_secs: f64,
@@ -299,7 +301,7 @@ impl ApplicationHandler for OverlayApp {
             }
         }
 
-        // Responding ? hold ? return flight ? Idle
+        // Responding → hold → return flight → Idle
         if self.voice_state == VoiceState::Responding {
             let since = self.responding_since.get_or_insert(now);
             let elapsed_total = now.duration_since(*since).as_secs();
@@ -307,6 +309,19 @@ impl ApplicationHandler for OverlayApp {
                 .audio_player
                 .as_ref()
                 .map_or(true, |p| !p.is_playing());
+
+            // CU-specific safety timeout: if CU never resolves within 30 s, unblock the
+            // state machine so the app does not get stuck waiting forever.
+            if self.cu_coordinate_pending {
+                let cu_elapsed = self
+                    .cu_pending_since
+                    .map_or(0, |t| now.duration_since(t).as_secs());
+                if cu_elapsed >= 30 {
+                    log::warn!("CU safety timeout — clearing cu_coordinate_pending");
+                    self.cu_coordinate_pending = false;
+                    self.cu_pending_since = None;
+                }
+            }
 
             match self.render_state.navigation_mode {
                 CursorNavigationMode::NavigatingToTarget => {}
@@ -322,19 +337,22 @@ impl ApplicationHandler for OverlayApp {
                 }
                 CursorNavigationMode::ReturningToMouse => {}
                 CursorNavigationMode::FollowingMouse => {
-                    if let Some(s) =
-                        self.voice_state.apply(VoiceStateTransition::ResponseComplete)
-                    {
-                        self.voice_state = s;
-                        self.render_state.voice_state = self.voice_state;
+                    // Only transition to Idle when CU has resolved (or timed out) AND TTS is done.
+                    if !self.cu_coordinate_pending && tts_done {
+                        if let Some(s) =
+                            self.voice_state.apply(VoiceStateTransition::ResponseComplete)
+                        {
+                            self.voice_state = s;
+                            self.render_state.voice_state = self.voice_state;
+                        }
+                        self.responding_since = None;
+                        self.pointing_hold_since = None;
                     }
-                    self.responding_since = None;
-                    self.pointing_hold_since = None;
                 }
             }
 
             if elapsed_total >= 45 {
-                log::warn!("Responding safety timeout � returning to Idle");
+                log::warn!("Responding safety timeout — returning to Idle");
                 if let Some(s) =
                     self.voice_state.apply(VoiceStateTransition::ResponseComplete)
                 {
@@ -344,6 +362,8 @@ impl ApplicationHandler for OverlayApp {
                 }
                 self.responding_since = None;
                 self.pointing_hold_since = None;
+                self.cu_coordinate_pending = false;
+                self.cu_pending_since = None;
             }
         }
 
@@ -399,7 +419,11 @@ impl ApplicationHandler for OverlayApp {
 
         // In FollowingMouse mode, draw at the predicted position.
         // In all other modes, state machine owns cursor_x/cursor_y.
-        if self.render_state.navigation_mode == CursorNavigationMode::FollowingMouse {
+        // Also update during Listening so the waveform stays anchored to the real cursor.
+        if self.render_state.navigation_mode == CursorNavigationMode::FollowingMouse
+            || self.render_state.voice_state == VoiceState::Listening
+            || self.render_state.voice_state == VoiceState::Processing
+        {
             self.render_state.cursor_x = predicted_local.0;
             self.render_state.cursor_y = predicted_local.1;
         }
@@ -407,8 +431,11 @@ impl ApplicationHandler for OverlayApp {
         self.render_state.update(delta_seconds, Some(fresh_local));
 
         // Determine whether anything visible changed this frame.
+        // Listening state always repaints so waveform bars animate every frame.
         let is_animating = self.render_state.navigation_mode != CursorNavigationMode::FollowingMouse
-            || self.render_state.speech_bubble_opacity > 0.0;
+            || self.render_state.speech_bubble_opacity > 0.0
+            || self.render_state.voice_state == VoiceState::Listening
+            || self.render_state.voice_state == VoiceState::Processing;
         let needs_repaint = cursor_moved || is_animating;
 
         // ---- Phase 3: render ----
@@ -531,6 +558,8 @@ impl OverlayApp {
                     self.claude_pipeline_active = false;
                     self.responding_since = None;
                     self.pointing_hold_since = None;
+                    self.cu_coordinate_pending = false;
+                    self.cu_pending_since = None;
 
                     if let Some(p) = &mut self.audio_player {
                         p.stop();
@@ -706,6 +735,8 @@ impl OverlayApp {
                     crate::core::bubble_text::pick_bubble_phrase(is_pointing);
 
                 self.responding_since = Some(Instant::now());
+                self.cu_coordinate_pending = true;
+                self.cu_pending_since = Some(Instant::now());
                 self.claude_pipeline_active = false;
                 self.processing_since = None;
             }
@@ -739,6 +770,20 @@ impl OverlayApp {
                 self.render_state.voice_state = self.voice_state;
                 self.processing_since = None;
                 self.claude_pipeline_active = false;
+            }
+            UiEvent::ComputerUseCoordinate(gx, gy) => {
+                // Only act when still in Responding — if the user pressed hotkey again,
+                // we're already in a new state and this stale coordinate must be ignored.
+                if self.voice_state != VoiceState::Responding {
+                    return;
+                }
+                log::info!("Computer Use coordinate received: ({gx:.1}, {gy:.1})");
+                self.cu_coordinate_pending = false;
+                self.cu_pending_since = None;
+                let local_x = gx - self.overlay_x as f64;
+                let local_y = gy - self.overlay_y as f64;
+                let bubble_text = self.render_state.speech_bubble_text.clone();
+                self.render_state.start_flight_to(local_x, local_y, bubble_text);
             }
         }
     }

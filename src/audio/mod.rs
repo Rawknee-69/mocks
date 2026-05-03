@@ -23,6 +23,9 @@ pub enum UiEvent {
     TtsAudio(Vec<u8>),
     /// TTS synthesis failed — caller should fall back to espeak-ng.
     TtsError(String),
+    /// Precise cursor target from Computer Use, arrives after LlmResponse.
+    /// The render loop starts the cursor flight on this event.
+    ComputerUseCoordinate(f64, f64),
 }
 
 /// Audio subsystem errors. All are recoverable — the app continues without audio.

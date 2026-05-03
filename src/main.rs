@@ -153,6 +153,8 @@ fn main() {
         last_config_poll_at,
         last_config_modified_at,
         simulation_mode,
+        cu_coordinate_pending: false,
+        cu_pending_since: None,
         frame_start: Instant::now(),
         elapsed_secs: 0.0,
         refresh_hz: crate::platform::query_refresh_hz(),

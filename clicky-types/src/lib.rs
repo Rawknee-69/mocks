@@ -61,8 +61,9 @@ pub enum ServerMessage {
         /// Text that will be spoken aloud via TTS.
         spoken_text: String,
 
-        /// Global display coordinate for the cursor overlay to fly to.
-        /// `None` when there is no element to point at.
+        /// POINT-tag fallback coordinate parsed from the LLM text.
+        /// Computer Use coordinate is delivered later via `ComputerUseCoordinate`
+        /// so TTS playback is not blocked by the Computer Use round-trip.
         coordinate: Option<(f64, f64)>,
 
         /// Metadata for every captured display (used for POINT-tag fallback mapping).
@@ -71,6 +72,10 @@ pub enum ServerMessage {
 
     /// Raw MP3 audio bytes synthesized by ElevenLabs TTS.
     TtsAudio { mp3_bytes: Vec<u8> },
+
+    /// Precise cursor target from Computer Use — arrives after `LlmResponse` so TTS is not delayed.
+    /// The frontend starts the cursor flight when this is received.
+    ComputerUseCoordinate { x: f64, y: f64 },
 
     /// A pipeline stage failed. The frontend should return to Idle state.
     Error {

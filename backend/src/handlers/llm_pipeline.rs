@@ -6,6 +6,7 @@ use crate::core::{coordinate_mapper, point_parser};
 use crate::error::AppError;
 use crate::handlers::tts;
 use clicky_types::{DisplayInfo, ScreenshotData, ServerMessage};
+use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
@@ -24,9 +25,9 @@ pub struct LlmPipelineConfig {
 /// 1. Uses screenshots provided by the frontend.
 /// 2. Calls OpenRouter vision API (streaming, Nemotron Omni).
 /// 3. Parses POINT tag from response.
-/// 4. Spawns Deepgram TTS in parallel with Computer Use coordinate detection.
-/// 5. Runs Computer Use for precise coordinates.
-/// 6. Sends `ServerMessage::LlmResponse`.
+/// 4. Sends `ServerMessage::LlmResponse` immediately (coordinate = POINT fallback or None).
+/// 5. Spawns Deepgram TTS in parallel.
+/// 6. Spawns Computer Use in parallel; sends `ServerMessage::ComputerUseCoordinate` when done.
 pub async fn run_llm_pipeline(
     http_client: reqwest::Client,
     config: LlmPipelineConfig,
@@ -81,8 +82,44 @@ pub async fn run_llm_pipeline(
         }
     };
 
+    if response_text.is_empty() {
+        warn!("LLM returned empty response, aborting pipeline");
+        let _ = server_tx
+            .send(AppError::Llm("empty response from model".into()).into_server_message())
+            .await;
+        return;
+    }
+
+    append_to_log(&format!("[LLM] transcript: {transcript}\n[LLM] response: {response_text}\n"));
+
     let parsed = point_parser::parse_claude_response(&response_text);
 
+    // Compute the POINT-tag fallback coordinate (cheap, synchronous).
+    let point_tag_coordinate =
+        parsed.pointing.as_ref().and_then(|pointing| {
+            coordinate_mapper::find_target_display(pointing.screen_number, &display_infos).map(
+                |display| {
+                    let global = coordinate_mapper::map_screenshot_pixels_to_global(
+                        pointing.screenshot_pixel_x,
+                        pointing.screenshot_pixel_y,
+                        display,
+                    );
+                    (global.x, global.y)
+                },
+            )
+        });
+
+    // Send LlmResponse immediately so the frontend transitions to Responding and TTS plays
+    // without waiting for the Computer Use round-trip.
+    let _ = server_tx
+        .send(ServerMessage::LlmResponse {
+            spoken_text: parsed.spoken_text.clone(),
+            coordinate: point_tag_coordinate,
+            display_infos: display_infos.clone(),
+        })
+        .await;
+
+    // Spawn TTS in parallel — fires alongside Computer Use.
     if config.tts_enabled && !parsed.spoken_text.is_empty() {
         if let Some(ref deepgram_api_key) = config.deepgram_api_key {
             let tts_client = http_client.clone();
@@ -97,40 +134,36 @@ pub async fn run_llm_pipeline(
         }
     }
 
-    let computer_use_coordinate = detect_computer_use_coordinate(
-        &http_client,
-        &screenshots,
-        &display_infos,
-        &config.openrouter_api_key,
-        &transcript,
-        Arc::clone(&config.llm_rate_limiter),
-    )
-    .await;
+    // Spawn Computer Use in a separate task so it never blocks TTS or LlmResponse delivery.
+    // If it finds a more precise coordinate it sends ComputerUseCoordinate to the frontend.
+    {
+        let cu_client = http_client.clone();
+        let cu_screenshots = screenshots.clone();
+        let cu_display_infos = display_infos.clone();
+        let cu_api_key = config.openrouter_api_key.clone();
+        let cu_transcript = transcript.clone();
+        let cu_rate_limiter = Arc::clone(&config.llm_rate_limiter);
+        let cu_tx = server_tx.clone();
 
-    let final_coordinate = if let Some(coord) = computer_use_coordinate {
-        Some(coord)
-    } else if let Some(ref pointing) = parsed.pointing {
-        coordinate_mapper::find_target_display(pointing.screen_number, &display_infos).map(
-            |display| {
-                let global = coordinate_mapper::map_screenshot_pixels_to_global(
-                    pointing.screenshot_pixel_x,
-                    pointing.screenshot_pixel_y,
-                    display,
-                );
-                (global.x, global.y)
-            },
-        )
-    } else {
-        None
-    };
+        tokio::spawn(async move {
+            let result = detect_computer_use_coordinate(
+                &cu_client,
+                &cu_screenshots,
+                &cu_display_infos,
+                &cu_api_key,
+                &cu_transcript,
+                cu_rate_limiter,
+            )
+            .await;
 
-    let _ = server_tx
-        .send(ServerMessage::LlmResponse {
-            spoken_text: parsed.spoken_text,
-            coordinate: final_coordinate,
-            display_infos,
-        })
-        .await;
+            if let Some((x, y)) = result {
+                append_to_log(&format!("[CU] coordinate: ({x:.1}, {y:.1})\n"));
+                let _ = cu_tx
+                    .send(ServerMessage::ComputerUseCoordinate { x, y })
+                    .await;
+            }
+        });
+    }
 }
 
 async fn detect_computer_use_coordinate(
@@ -205,3 +238,18 @@ fn log_debug_screenshots(screenshots: &[ScreenshotData], display_infos: &[Displa
 
 #[cfg(not(debug_assertions))]
 fn log_debug_screenshots(_screenshots: &[ScreenshotData], _display_infos: &[DisplayInfo]) {}
+
+/// Appends `text` to `clicky_llm_log.txt` in the current working directory.
+///
+/// Uses `OpenOptions::append` so entries accumulate across sessions.
+/// Errors are silently ignored — logging must never crash the pipeline.
+fn append_to_log(text: &str) {
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("clicky_llm_log.txt")
+        .and_then(|mut f| f.write_all(text.as_bytes()));
+    if let Err(err) = result {
+        warn!("failed to write LLM log: {err}");
+    }
+}

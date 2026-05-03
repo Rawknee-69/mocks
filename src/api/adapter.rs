@@ -28,6 +28,7 @@ impl ApiAdapter {
     /// Connects to `ws://127.0.0.1:port`, spawning the background WS task.
     ///
     /// Must be called from within a tokio runtime context.
+    #[allow(dead_code)]
     pub fn connect(port: u16) -> Self {
         let (client_tx, client_rx) = async_mpsc::channel::<ClientMessage>(128);
         let (ui_event_tx, ui_event_rx) = std_mpsc::channel::<UiEvent>();
@@ -239,6 +240,10 @@ fn server_message_to_ui_event(msg: ServerMessage) -> Option<UiEvent> {
 
         ServerMessage::TtsAudio { mp3_bytes } => {
             Some(UiEvent::TtsAudio(mp3_bytes))
+        }
+
+        ServerMessage::ComputerUseCoordinate { x, y } => {
+            Some(UiEvent::ComputerUseCoordinate(x, y))
         }
 
         ServerMessage::Error { code, message } => {

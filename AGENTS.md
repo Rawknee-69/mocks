@@ -190,13 +190,22 @@ Backend `.env` (at `backend/.env`): `ASSEMBLYAI_API_KEY`, `ANTHROPIC_API_KEY`, `
 - User requires full type safety — no type casting allowed anywhere in the codebase.
 - User wants the backend to only process data; screenshots must be captured by the frontend and sent to the backend, not captured server-side.
 - When presenting architectural options, explain first and ask which approach to implement before building.
+- User prefers cost-reduction and vendor unlock: replace proprietary paid APIs (ElevenLabs, AssemblyAI, Claude) with OpenRouter + Deepgram alternatives when asked to reduce costs.
+- On Windows, use a temp file for git commit messages — PowerShell does not support heredoc syntax.
 
 ## Learned Workspace Facts
 
 - `clicky-types` crate is the single source of truth for all shared WS message types; never duplicate these types in frontend or backend.
 - `backend/src/error.rs` and `backend/src/logger.rs` implement centralised error handling and structured logging (log level controlled via `LOG_LEVEL` env var; off in prod).
-- `src/api/adapter.rs` is the only file in the frontend that knows about the WebSocket connection; all other frontend code communicates through `UiEvent` as before.
+- `src/api/adapter.rs` is the only file in the frontend that knows about the WebSocket connection; all other frontend code communicates through `UiEvent` as before. `ApiAdapter::try_connect` is the real entry point used by `main.rs`; `connect` is unused dead code and carries `#[allow(dead_code)]`.
 - Windows build requires CMake (`winget install Kitware.CMake`) and LLVM (`winget install LLVM.LLVM`) with `LIBCLANG_PATH=C:\Program Files\LLVM\bin` set; `bindgen` needs these at build time.
-- The Tokio render-loop pattern: call `let _tokio_guard = tokio_rt.enter()` before `ApiAdapter::connect` so all `tokio::spawn` / `spawn_blocking` calls in the synchronous event loop work without "no reactor running" panics.
+- The Tokio render-loop pattern: call `let _tokio_guard = tokio_rt.enter()` before `ApiAdapter::try_connect` so all `tokio::spawn` / `spawn_blocking` calls in the synchronous event loop work without "no reactor running" panics.
 - Windows transparent overlay correctness: keep `WS_EX_LAYERED` (required for `UpdateLayeredWindow`), add `WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` for click-through, call `DwmExtendFrameIntoClientArea` with all-(-1) MARGINS for DWM "sheet of glass" compositing. Do NOT add `WS_EX_NOREDIRECTIONBITMAP` alongside `WS_EX_LAYERED` — they conflict and break DWM compositing.
 - `pollster::block_on` must be used (not `.await` or `tokio::Handle::current().block_on`) for async wgpu init calls inside the winit event loop, since the event loop runs inside a tokio context and nesting `block_on` panics.
+- The backend now uses Deepgram Nova-3 (STT), Deepgram Aura-2 (TTS), and OpenRouter (LLM/vision/computer-use) instead of AssemblyAI, ElevenLabs, and Anthropic; env vars are `DEEPGRAM_API_KEY` and `OPENROUTER_API_KEY`.
+- `reqwest::Client` must be created once and shared across requests; never call `Client::new()` inside a per-request handler.
+- Conversation history uses `VecDeque` to avoid O(n) `remove(0)` shifts; debug screenshot writes are gated by `CLICKY_DEBUG_SCREENSHOTS=1` env var.
+- `WebSocketConfig` in tungstenite is non-exhaustive; use `WebSocketConfig::default()` and then set fields — struct literal construction panics.
+- Computer Use uses a two-pass zoom strategy: Pass 1 resizes the full screenshot to `MAX_LONG_EDGE=1920` (aspect-ratio-preserving) for a coarse coordinate; Pass 2 crops a 25% window centred on that coord and resamples to model resolution for ~4x pixel density and ~3-4px precision. Pass 2 failure falls back to the Pass 1 result.
+- `is_animating` in `window.rs` must include `|| voice_state == Processing` and cursor position updates must run during `Processing` state — otherwise the spinning arc freezes and doesn't follow the mouse when the mic is not active.
+- LLM models (especially free-tier) may hallucinate the exact screen centre `(screen_width/2, screen_height/2)` when unsure instead of returning null; treat a result matching the geometric screen centre as a detection failure and discard it.
