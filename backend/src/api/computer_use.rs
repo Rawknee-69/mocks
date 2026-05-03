@@ -220,6 +220,7 @@ pub async fn detect_element_location(
         user_question,
         full_dims,
         Arc::clone(&rate_limiter),
+        1,
     )
     .await?;
 
@@ -257,8 +258,9 @@ pub async fn detect_element_location(
         ZOOM_FRACTION,
     );
 
-    // Compute model dims from the crop's own aspect ratio so scaling is exact.
-    let zoom_dims = compute_model_dims(crop.w, crop.h);
+    // Compute model dims from the crop's own aspect ratio — always upscale to
+    // MAX_LONG_EDGE so pass 2 actually provides a pixel-density boost.
+    let zoom_dims = compute_model_dims_allow_upscale(crop.w, crop.h);
 
     let zoom_jpeg = match crop_and_resize(
         screenshot_jpeg,
@@ -285,9 +287,13 @@ pub async fn detect_element_location(
         effective_zoom,
     );
 
-    let pass2_question = format!(
-        "This is a {:.0}×{:.0} logical-point region zoomed from a larger display. {user_question}",
-        crop.w, crop.h,
+    let pass2_question = build_pass2_prompt(
+        user_question,
+        zoom_dims.width,
+        zoom_dims.height,
+        &crop,
+        display_width_points,
+        display_height_points,
     );
 
     // Pass 2 failure falls back to pass 1 — never lose the coarse result.
@@ -298,6 +304,7 @@ pub async fn detect_element_location(
         &pass2_question,
         zoom_dims,
         rate_limiter,
+        2,
     )
     .await
     {
@@ -337,6 +344,20 @@ fn compute_model_dims(w: f64, h: f64) -> ModelDims {
     // One scale factor for both axes.
     let scale = (MAX_LONG_EDGE as f64 / w.max(h)).min(1.0);
 
+    ModelDims {
+        width: align2(((w * scale).round() as u32).max(2)),
+        height: align2(((h * scale).round() as u32).max(2)),
+    }
+}
+
+/// Like `compute_model_dims` but without the `.min(1.0)` cap — always upscales the
+/// long edge to `MAX_LONG_EDGE`.  Correct for pass 2 where the crop is intentionally
+/// smaller than the display (e.g. 480×270 from a 1920×1080 display → 4× zoom).
+fn compute_model_dims_allow_upscale(w: f64, h: f64) -> ModelDims {
+    let w = w.max(1.0);
+    let h = h.max(1.0);
+    // No .min(1.0) — upscaling to MAX_LONG_EDGE is the whole point of pass 2.
+    let scale = MAX_LONG_EDGE as f64 / w.max(h);
     ModelDims {
         width: align2(((w * scale).round() as u32).max(2)),
         height: align2(((h * scale).round() as u32).max(2)),
@@ -465,7 +486,10 @@ fn denormalise_if_needed(x: f64, y: f64, dims: ModelDims) -> (f64, f64) {
     // Gemini sometimes returns bounding-box coords in the 0-1000 range.
     let both_under_1000 = (0.0..=1000.0).contains(&x) && (0.0..=1000.0).contains(&y);
     let are_pixel_coords = x > 1.0 || y > 1.0; // at least one axis non-trivially > 1
-    if both_under_1000 && are_pixel_coords && dims.width > 1000 {
+    // Only treat as 0-1000 normalised when the model image itself is small (≤ 1000px).
+    // On a 1920×1080 pass-2 image, values like 550 are genuine pixels, not normalised.
+    let model_is_small = dims.width <= 1000 && dims.height <= 1000;
+    if both_under_1000 && are_pixel_coords && model_is_small {
         info!(
             "ComputerUse: 0-1000 coords ({x:.1}, {y:.1}) → scaling to {}×{}",
             dims.width, dims.height,
@@ -493,6 +517,7 @@ async fn call_with_retry(
     question: &str,
     dims: ModelDims,
     rate_limiter: Arc<Semaphore>,
+    pass: u8,
 ) -> Option<(f64, f64)> {
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
@@ -502,10 +527,15 @@ async fn call_with_retry(
             warn!("ComputerUse: retry {}/{MAX_ATTEMPTS}", attempt + 1);
         }
 
-        if let Some(c) =
-            call_once(client, provider, jpeg, question, dims, Arc::clone(&rate_limiter)).await
-        {
-            return Some(c);
+        match call_once(client, provider, jpeg, question, dims, Arc::clone(&rate_limiter), pass, attempt + 1).await {
+            Ok(Some(coord)) => return Some(coord),
+            Ok(None) => {
+                // Model explicitly said no element — a valid null, do NOT retry.
+                return None;
+            }
+            Err(()) => {
+                // Network/parse failure — loop for retry.
+            }
         }
     }
 
@@ -533,13 +563,15 @@ async fn call_once(
     question: &str,
     dims: ModelDims,
     rate_limiter: Arc<Semaphore>,
-) -> Option<(f64, f64)> {
+    pass: u8,
+    attempt: u32,
+) -> Result<Option<(f64, f64)>, ()> {
     match provider {
         Provider::OpenRouter { api_key, model } => {
-            call_once_openrouter(client, api_key, model, jpeg, question, dims, rate_limiter).await
+            call_once_openrouter(client, api_key, model, jpeg, question, dims, rate_limiter, pass, attempt).await
         }
         Provider::Gemini { api_key, model } => {
-            call_once_gemini(client, api_key, model, jpeg, question, dims, rate_limiter).await
+            call_once_gemini(client, api_key, model, jpeg, question, dims, rate_limiter, pass, attempt).await
         }
     }
 }
@@ -552,7 +584,9 @@ async fn call_once_openrouter(
     question: &str,
     dims: ModelDims,
     rate_limiter: Arc<Semaphore>,
-) -> Option<(f64, f64)> {
+    pass: u8,
+    attempt: u32,
+) -> Result<Option<(f64, f64)>, ()> {
     let b64 = STANDARD.encode(jpeg);
     let prompt = build_prompt(question, dims.width, dims.height);
 
@@ -578,7 +612,7 @@ async fn call_once_openrouter(
         .acquire()
         .await
         .map_err(|_| warn!("ComputerUse: semaphore closed"))
-        .ok()?;
+        .map_err(|_| ())?;
 
     let resp = client
         .post(OPENROUTER_API_URL)
@@ -589,7 +623,7 @@ async fn call_once_openrouter(
         .send()
         .await
         .map_err(|e| warn!("ComputerUse: network error: {e}"))
-        .ok()?;
+        .map_err(|_| ())?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -598,14 +632,14 @@ async fn call_once_openrouter(
             "ComputerUse: HTTP {status} — {}",
             &text[..text.len().min(300)]
         );
-        return None;
+        return Err(());
     }
 
     let json: Value = resp
         .json()
         .await
         .map_err(|e| warn!("ComputerUse: response JSON: {e}"))
-        .ok()?;
+        .map_err(|_| ())?;
 
     let raw = json["choices"][0]["message"]["content"]
         .as_str()
@@ -629,11 +663,17 @@ async fn call_once_openrouter(
             "ComputerUse: empty content — full message: {}",
             json["choices"][0]["message"]
         );
-        return None;
+        return Err(());
     }
 
     debug!("ComputerUse raw: {raw}");
-    parse_coordinate(&raw)
+    write_cu_debug(pass, attempt, jpeg, &prompt, &raw);
+
+    match parse_coordinate(&raw) {
+        ParseResult::Found(x, y) => Ok(Some((x, y))),
+        ParseResult::NoElement => Ok(None),
+        ParseResult::ParseFailed => Err(()),
+    }
 }
 
 async fn call_once_gemini(
@@ -644,7 +684,9 @@ async fn call_once_gemini(
     question: &str,
     dims: ModelDims,
     rate_limiter: Arc<Semaphore>,
-) -> Option<(f64, f64)> {
+    pass: u8,
+    attempt: u32,
+) -> Result<Option<(f64, f64)>, ()> {
     let b64 = STANDARD.encode(jpeg);
     let prompt = build_prompt(question, dims.width, dims.height);
     let url = format!("{GEMINI_API_BASE}/{model}:generateContent?key={api_key}");
@@ -672,7 +714,7 @@ async fn call_once_gemini(
         .acquire()
         .await
         .map_err(|_| warn!("ComputerUse: semaphore closed"))
-        .ok()?;
+        .map_err(|_| ())?;
 
     let resp = client
         .post(&url)
@@ -682,7 +724,7 @@ async fn call_once_gemini(
         .send()
         .await
         .map_err(|e| warn!("ComputerUse (Gemini): network error: {e}"))
-        .ok()?;
+        .map_err(|_| ())?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -691,14 +733,14 @@ async fn call_once_gemini(
             "ComputerUse (Gemini): HTTP {status} — {}",
             &text[..text.len().min(300)]
         );
-        return None;
+        return Err(());
     }
 
     let json: Value = resp
         .json()
         .await
         .map_err(|e| warn!("ComputerUse (Gemini): response JSON: {e}"))
-        .ok()?;
+        .map_err(|_| ())?;
 
     let raw = json["candidates"][0]["content"]["parts"][0]["text"]
         .as_str()
@@ -711,11 +753,17 @@ async fn call_once_gemini(
             "ComputerUse (Gemini): empty content — full response: {}",
             json["candidates"][0]["content"]
         );
-        return None;
+        return Err(());
     }
 
     debug!("ComputerUse (Gemini) raw: {raw}");
-    parse_coordinate(&raw)
+    write_cu_debug(pass, attempt, jpeg, &prompt, &raw);
+
+    match parse_coordinate(&raw) {
+        ParseResult::Found(x, y) => Ok(Some((x, y))),
+        ParseResult::NoElement => Ok(None),
+        ParseResult::ParseFailed => Err(()),
+    }
 }
 
 // ─── Prompt ───────────────────────────────────────────────────────────────────
@@ -733,7 +781,66 @@ fn build_prompt(question: &str, width: u32, height: u32) -> String {
     )
 }
 
+/// Prompt for pass-2 zoomed crops.
+///
+/// Tells the model exactly where this crop sits in the full display so it can
+/// reason about context and return pixel coordinates in the crop's own space.
+fn build_pass2_prompt(
+    question: &str,
+    width: u32,
+    height: u32,
+    crop: &Crop,
+    display_w: f64,
+    display_h: f64,
+) -> String {
+    format!(
+        "You are a GUI automation assistant.\n\
+         The screenshot is exactly {width}×{height} pixels.\n\
+         It is a zoomed crop from a {display_w:.0}×{display_h:.0} display, \
+         covering display coordinates ({:.0},{:.0})–({:.0},{:.0}).\n\
+         The target element should be visible near the centre of this image.\n\
+         Origin (0,0) is top-left; X increases right, Y increases down.\n\n\
+         User request: \"{question}\"\n\n\
+         Reply with ONLY valid JSON:\n\
+         • Element found:  {{\"x\":<int 0–{width}>,\"y\":<int 0–{height}>,\"label\":\"<label>\"}}\n\
+         • No element:     {{\"x\":null,\"y\":null,\"label\":\"none\"}}",
+        crop.x, crop.y, crop.x + crop.w, crop.y + crop.h,
+    )
+}
+
+// ─── Debug logging ────────────────────────────────────────────────────────────
+
+/// Write the JPEG sent to the model plus a sidecar `.txt` with the prompt and
+/// raw response into `backend/test_ss/` for offline inspection.
+///
+/// All I/O errors are silently ignored — debug logging must never crash the
+/// pipeline.
+fn write_cu_debug(pass: u8, attempt: u32, jpeg: &[u8], prompt: &str, response: &str) {
+    let dir = std::path::Path::new("test_ss");
+    let _ = std::fs::create_dir_all(dir);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let stem = format!("cu_{ts}_pass{pass}_attempt{attempt}");
+    let _ = std::fs::write(dir.join(format!("{stem}.jpg")), jpeg);
+    let _ = std::fs::write(
+        dir.join(format!("{stem}.txt")),
+        format!("=== PROMPT ===\n{prompt}\n\n=== RESPONSE ===\n{response}\n"),
+    );
+}
+
 // ─── Response parsing ─────────────────────────────────────────────────────────
+
+/// Three-state result from a single JSON parse attempt.
+enum ParseResult {
+    Found(f64, f64),
+    /// Model returned `{"x":null,"y":null}` — element genuinely not present.
+    /// Callers must NOT retry on this variant.
+    NoElement,
+    /// Response could not be parsed at all — retry may help.
+    ParseFailed,
+}
 
 /// Multi-strategy coordinate extractor.
 ///
@@ -742,30 +849,59 @@ fn build_prompt(question: &str, width: u32, height: u32) -> String {
 /// 2. Direct JSON parse on the stripped text.
 /// 3. Strip markdown fences (` ```json … ``` `), retry parse.
 /// 4. Find the last balanced `{…}` substring (handles JSON-in-prose).
-fn parse_coordinate(text: &str) -> Option<(f64, f64)> {
+///
+/// Returns `NoElement` as soon as any strategy confirms null coords, so the
+/// caller never retries a valid "no element" response.
+fn parse_coordinate(text: &str) -> ParseResult {
     let stripped = strip_reasoning(text);
     let s = stripped.trim();
 
-    try_parse(s)
-        .or_else(|| try_parse(strip_fences(s).trim()))
-        .or_else(|| last_brace_span(s).and_then(try_parse))
-        .or_else(|| {
-            warn!("ComputerUse: all parse strategies failed — text: {}", &text[..text.len().min(400)]);
-            None
-        })
+    // Strategy 1 — direct parse.
+    match try_parse_result(s) {
+        ParseResult::ParseFailed => {}
+        other => return other,
+    }
+
+    // Strategy 2 — strip markdown fences.
+    match try_parse_result(strip_fences(s).trim()) {
+        ParseResult::ParseFailed => {}
+        other => return other,
+    }
+
+    // Strategy 3 — last balanced `{…}`.
+    if let Some(span) = last_brace_span(s) {
+        match try_parse_result(span) {
+            ParseResult::ParseFailed => {}
+            other => return other,
+        }
+    }
+
+    warn!("ComputerUse: all parse strategies failed — text: {}", &text[..text.len().min(400)]);
+    ParseResult::ParseFailed
 }
 
-fn try_parse(s: &str) -> Option<(f64, f64)> {
-    let c: CoordJson = serde_json::from_str(s).ok()?;
+fn try_parse_result(s: &str) -> ParseResult {
+    let Ok(c) = serde_json::from_str::<CoordJson>(s) else {
+        return ParseResult::ParseFailed;
+    };
     match (c.x, c.y) {
         (Some(FlexF64(x)), Some(FlexF64(y))) => {
             info!("ComputerUse: parsed coord ({x:.0}, {y:.0})");
-            Some((x, y))
+            ParseResult::Found(x, y)
         }
         _ => {
             info!("ComputerUse: model signalled no element (null coords)");
-            None
+            ParseResult::NoElement
         }
+    }
+}
+
+/// Thin wrapper kept so existing unit tests compile unchanged.
+#[allow(dead_code)]
+fn try_parse(s: &str) -> Option<(f64, f64)> {
+    match try_parse_result(s) {
+        ParseResult::Found(x, y) => Some((x, y)),
+        _ => None,
     }
 }
 
@@ -859,6 +995,30 @@ mod tests {
     }
 
     #[test]
+    fn pass2_always_reaches_max_long_edge() {
+        // Each entry is (display_w, display_h) → crop is 25% of display.
+        // compute_model_dims_allow_upscale must always yield long_edge == MAX_LONG_EDGE.
+        let cases: &[(f64, f64)] = &[
+            (640.0, 480.0),    // 160×120 crop → 1920px long edge
+            (1280.0, 720.0),   // 320×180 crop → 1920px long edge
+            (1920.0, 1080.0),  // 480×270 crop → 1920px long edge  ← was broken at 1×
+            (2560.0, 1440.0),  // 640×360 crop → 1920px long edge
+            (3840.0, 2160.0),  // 960×540 crop → 1920px long edge
+            (7680.0, 4320.0),  // 1920×1080 crop → 1920px long edge (already dense)
+        ];
+        for (dw, dh) in cases {
+            let crop_w = dw * 0.25;
+            let crop_h = dh * 0.25;
+            let d = compute_model_dims_allow_upscale(crop_w, crop_h);
+            let long_edge = d.width.max(d.height);
+            assert_eq!(
+                long_edge, MAX_LONG_EDGE,
+                "display {dw}×{dh} crop {crop_w}×{crop_h} → long edge {long_edge} ≠ {MAX_LONG_EDGE}"
+            );
+        }
+    }
+
+    #[test]
     fn degenerate_single_pixel_no_panic() {
         let d = compute_model_dims(1.0, 1.0);
         assert!(d.width >= 2 && d.height >= 2);
@@ -917,10 +1077,17 @@ mod tests {
 
     // ── Parsing ────────────────────────────────────────────────────────────────
 
+    fn parse_opt(text: &str) -> Option<(f64, f64)> {
+        match parse_coordinate(text) {
+            ParseResult::Found(x, y) => Some((x, y)),
+            _ => None,
+        }
+    }
+
     #[test]
     fn plain_json() {
         assert_eq!(
-            parse_coordinate(r#"{"x":640,"y":400,"label":"save"}"#),
+            parse_opt(r#"{"x":640,"y":400,"label":"save"}"#),
             Some((640.0, 400.0))
         );
     }
@@ -932,38 +1099,47 @@ mod tests {
     fn think_block_stripped_before_parse() {
         let text =
             "<think>\nI see a Submit button at around x=640.\n</think>{\"x\":640,\"y\":400}";
-        assert_eq!(parse_coordinate(text), Some((640.0, 400.0)));
+        assert_eq!(parse_opt(text), Some((640.0, 400.0)));
     }
 
     #[test]
     fn reasoning_tag_variant() {
         let text = "<reasoning>analysis</reasoning>{\"x\":50,\"y\":75}";
-        assert_eq!(parse_coordinate(text), Some((50.0, 75.0)));
+        assert_eq!(parse_opt(text), Some((50.0, 75.0)));
     }
 
     #[test]
     fn markdown_fences_stripped() {
         let text = "```json\n{\"x\":320,\"y\":200}\n```";
-        assert_eq!(parse_coordinate(text), Some((320.0, 200.0)));
+        assert_eq!(parse_opt(text), Some((320.0, 200.0)));
     }
 
     #[test]
     fn json_in_prose() {
         let text = r#"The element is at {"x":50,"y":75,"label":"link"}."#;
-        assert_eq!(parse_coordinate(text), Some((50.0, 75.0)));
+        assert_eq!(parse_opt(text), Some((50.0, 75.0)));
     }
 
     #[test]
     fn string_encoded_coords() {
         assert_eq!(
-            parse_coordinate(r#"{"x":"512","y":"384"}"#),
+            parse_opt(r#"{"x":"512","y":"384"}"#),
             Some((512.0, 384.0))
         );
     }
 
     #[test]
     fn null_returns_none() {
-        assert!(parse_coordinate(r#"{"x":null,"y":null,"label":"none"}"#).is_none());
+        assert!(parse_opt(r#"{"x":null,"y":null,"label":"none"}"#).is_none());
+    }
+
+    #[test]
+    fn null_is_no_element_not_parse_failed() {
+        // A valid null MUST be NoElement so call_with_retry does not retry it.
+        assert!(matches!(
+            parse_coordinate(r#"{"x":null,"y":null,"label":"none"}"#),
+            ParseResult::NoElement
+        ));
     }
 
     // ── Normalisation ──────────────────────────────────────────────────────────

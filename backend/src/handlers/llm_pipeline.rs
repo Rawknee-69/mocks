@@ -23,12 +23,9 @@ pub struct LlmPipelineConfig {
 
 /// Runs the full LLM pipeline for a completed transcript.
 ///
-/// 1. Uses screenshots provided by the frontend.
-/// 2. Calls the configured LLM provider (OpenRouter or Gemini) via streaming.
-/// 3. Parses POINT tag from response.
-/// 4. Sends `ServerMessage::LlmResponse` immediately (coordinate = POINT fallback or None).
-/// 5. Spawns Deepgram TTS in parallel.
-/// 6. Spawns Computer Use in parallel; sends `ServerMessage::ComputerUseCoordinate` when done.
+/// LLM and Computer Use fire simultaneously via `tokio::join!`.
+/// TTS fires as soon as LLM text is known (overlapping whatever CU time remains).
+/// A single `ServerMessage::PipelineReady` is emitted when all three are done.
 pub async fn run_llm_pipeline(
     http_client: reqwest::Client,
     config: LlmPipelineConfig,
@@ -67,36 +64,20 @@ pub async fn run_llm_pipeline(
     };
     messages.push(serde_json::json!({"role": "user", "content": user_content}));
 
-    let result = match config.llm_provider.as_ref() {
-        Provider::OpenRouter { api_key, model } => {
-            info!("sending to OpenRouter ({model})...");
-            openrouter::stream_llm_response(
-                &http_client,
-                api_key,
-                model,
-                openrouter::COMPANION_VOICE_RESPONSE_SYSTEM_PROMPT,
-                messages,
-                Arc::clone(&config.llm_rate_limiter),
-                |_chunk| {},
-            )
-            .await
-        }
-        Provider::Gemini { api_key, model } => {
-            info!("sending to Gemini ({model})...");
-            gemini::stream_llm_response(
-                &http_client,
-                api_key,
-                model,
-                openrouter::COMPANION_VOICE_RESPONSE_SYSTEM_PROMPT,
-                messages,
-                Arc::clone(&config.llm_rate_limiter),
-                |_chunk| {},
-            )
-            .await
-        }
-    };
+    // ── Fire LLM and Computer Use simultaneously ─────────────────────────────
+    let llm_future = run_llm_call(&http_client, &config, messages);
+    let cu_future = detect_computer_use_coordinate(
+        &http_client,
+        &screenshots,
+        &display_infos,
+        Arc::clone(&config.cu_provider),
+        &transcript,
+        Arc::clone(&config.llm_rate_limiter),
+    );
 
-    let response_text = match result {
+    let (llm_result, cu_result) = tokio::join!(llm_future, cu_future);
+
+    let response_text = match llm_result {
         Ok(text) => text,
         Err(err) => {
             error!("LLM API error: {err}");
@@ -117,7 +98,7 @@ pub async fn run_llm_pipeline(
 
     let parsed = point_parser::parse_claude_response(&response_text);
 
-    // Compute the POINT-tag fallback coordinate (cheap, synchronous).
+    // POINT-tag fallback coordinate — used when CU found nothing.
     let point_tag_coordinate =
         parsed.pointing.as_ref().and_then(|pointing| {
             coordinate_mapper::find_target_display(pointing.screen_number, &display_infos).map(
@@ -132,60 +113,78 @@ pub async fn run_llm_pipeline(
             )
         });
 
-    // Send LlmResponse immediately so the frontend transitions to Responding and TTS plays
-    // without waiting for the Computer Use round-trip.
-    let _ = server_tx
-        .send(ServerMessage::LlmResponse {
-            spoken_text: parsed.spoken_text.clone(),
-            coordinate: point_tag_coordinate,
-            display_infos: display_infos.clone(),
-        })
-        .await;
-
-    // Spawn TTS in parallel — fires alongside Computer Use.
-    if config.tts_enabled && !parsed.spoken_text.is_empty() {
-        if let Some(ref deepgram_api_key) = config.deepgram_api_key {
-            let tts_client = http_client.clone();
-            let tts_key = deepgram_api_key.clone();
-            let tts_voice = config.deepgram_tts_voice.clone();
-            let tts_text = parsed.spoken_text.clone();
-            let tts_tx = server_tx.clone();
-
-            tokio::spawn(async move {
-                tts::run_tts(&tts_client, &tts_key, tts_voice.as_deref(), tts_text, tts_tx).await;
-            });
+    // ── TTS fires after LLM text is known; CU is typically still running in
+    // join! above and is already done by this point (CU wall-clock > LLM).
+    // If CU finishes first, this await is effectively free.
+    let mp3_bytes = if config.tts_enabled && !parsed.spoken_text.is_empty() {
+        if let Some(ref api_key) = config.deepgram_api_key {
+            tts::synthesize_speech_bytes(
+                &http_client,
+                api_key,
+                config.deepgram_tts_voice.as_deref(),
+                &parsed.spoken_text,
+            )
+            .await
+        } else {
+            Vec::new()
         }
+    } else {
+        Vec::new()
+    };
+
+    let coordinate = cu_result.or(point_tag_coordinate);
+    if let Some((x, y)) = coordinate {
+        append_to_log(&format!("[CU] coordinate: ({x:.1}, {y:.1})\n"));
     }
 
-    // Spawn Computer Use in a separate task so it never blocks TTS or LlmResponse delivery.
-    // If it finds a more precise coordinate it sends ComputerUseCoordinate to the frontend.
-    {
-        let cu_client = http_client.clone();
-        let cu_screenshots = screenshots.clone();
-        let cu_display_infos = display_infos.clone();
-        let cu_provider = Arc::clone(&config.cu_provider);
-        let cu_transcript = transcript.clone();
-        let cu_rate_limiter = Arc::clone(&config.llm_rate_limiter);
-        let cu_tx = server_tx.clone();
+    // When the LLM returned nothing useful (empty spoken text) and no coordinate
+    // was found either, give the user audible feedback instead of silent Idle.
+    let final_spoken = if parsed.spoken_text.is_empty() {
+        "I didn't quite get you".to_owned()
+    } else {
+        parsed.spoken_text.clone()
+    };
 
-        tokio::spawn(async move {
-            let result = detect_computer_use_coordinate(
-                &cu_client,
-                &cu_screenshots,
-                &cu_display_infos,
-                cu_provider,
-                &cu_transcript,
-                cu_rate_limiter,
+    let _ = server_tx
+        .send(ServerMessage::PipelineReady {
+            spoken_text: final_spoken,
+            mp3_bytes,
+            coordinate,
+            display_infos,
+        })
+        .await;
+}
+
+async fn run_llm_call(
+    http_client: &reqwest::Client,
+    config: &LlmPipelineConfig,
+    messages: Vec<serde_json::Value>,
+) -> Result<String, AppError> {
+    match config.llm_provider.as_ref() {
+        Provider::OpenRouter { api_key, model } => {
+            info!("sending to OpenRouter ({model})...");
+            openrouter::stream_llm_response(
+                http_client,
+                api_key,
+                model,
+                openrouter::COMPANION_VOICE_RESPONSE_SYSTEM_PROMPT,
+                messages,
+                Arc::clone(&config.llm_rate_limiter),
             )
-            .await;
-
-            if let Some((x, y)) = result {
-                append_to_log(&format!("[CU] coordinate: ({x:.1}, {y:.1})\n"));
-                let _ = cu_tx
-                    .send(ServerMessage::ComputerUseCoordinate { x, y })
-                    .await;
-            }
-        });
+            .await
+        }
+        Provider::Gemini { api_key, model } => {
+            info!("sending to Gemini ({model})...");
+            gemini::stream_llm_response(
+                http_client,
+                api_key,
+                model,
+                openrouter::COMPANION_VOICE_RESPONSE_SYSTEM_PROMPT,
+                messages,
+                Arc::clone(&config.llm_rate_limiter),
+            )
+            .await
+        }
     }
 }
 

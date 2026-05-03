@@ -190,15 +190,22 @@ impl StreamingTranscriptionSession {
                 if result.is_final {
                     accumulated_finals.push(transcript_text);
                     let full = accumulated_finals.join(" ");
-                    let _ = transcript_sender_clone
-                        .send(TranscriptUpdate::Partial(full))
-                        .await;
 
                     if result.speech_final {
-                        // A speech_final=true marks a natural sentence boundary —
-                        // emit a partial so the UI updates, but don't close the session yet.
-                        // The real Final is sent on CloseStream flush below.
-                        debug!("Deepgram speech_final boundary reached");
+                        // speech_final=true is a natural sentence boundary and is the
+                        // authoritative complete transcript for this utterance. Emit
+                        // Final immediately — don't wait for the WebSocket to close.
+                        // The transcription bridge is waiting on this signal.
+                        debug!("Deepgram speech_final — emitting Final");
+                        has_delivered_final = true;
+                        let _ = transcript_sender_clone
+                            .send(TranscriptUpdate::Final(full))
+                            .await;
+                        break;
+                    } else {
+                        let _ = transcript_sender_clone
+                            .send(TranscriptUpdate::Partial(full))
+                            .await;
                     }
                 } else {
                     // Interim result: show accumulated finals + current interim

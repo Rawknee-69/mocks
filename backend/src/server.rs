@@ -261,8 +261,8 @@ async fn handle_connection(
                     }
                 }
 
-                // Track LlmResponse to update conversation history
-                if let ServerMessage::LlmResponse { ref spoken_text, .. } = message {
+                // Track PipelineReady to update conversation history
+                if let ServerMessage::PipelineReady { ref spoken_text, .. } = message {
                     if let Some(ref transcript) = last_transcript {
                         conversation_history
                             .push_back((transcript.clone(), spoken_text.clone()));

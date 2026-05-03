@@ -1,4 +1,4 @@
-/// OpenRouter chat completions API client with SSE streaming.
+/// OpenRouter chat completions API client.
 ///
 /// Drop-in replacement for the former Anthropic Claude client.
 /// Uses the OpenAI-compatible endpoint with Nemotron Omni as the model.
@@ -9,7 +9,6 @@
 /// - A caller-supplied `Arc<Semaphore>` enforces the 20 RPM OpenRouter cap.
 /// - On HTTP 429, retries with exponential back-off (1 s → 2 s → 4 s, max 3 attempts).
 use crate::error::AppError;
-use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
 use std::sync::Arc;
@@ -57,12 +56,10 @@ examples:
 
 pub use clicky_types::ScreenshotData;
 
-/// Streams an OpenRouter response for the given messages and collects the full text.
+/// Sends an OpenRouter request for the given messages and returns the full response text.
 ///
 /// Acquires one permit from `rate_limiter` before the HTTP request and releases on
 /// drop, enforcing the OpenRouter 20 RPM cap across all concurrent users.
-///
-/// `on_text_delta` is called with each incremental chunk as it arrives over SSE.
 pub async fn stream_llm_response(
     http_client: &Client,
     api_key: &str,
@@ -70,7 +67,6 @@ pub async fn stream_llm_response(
     system_prompt: &str,
     messages: Vec<serde_json::Value>,
     rate_limiter: Arc<Semaphore>,
-    mut on_text_delta: impl FnMut(&str),
 ) -> Result<String, AppError> {
     let mut system_messages: Vec<serde_json::Value> =
         vec![json!({"role": "system", "content": system_prompt})];
@@ -80,7 +76,7 @@ pub async fn stream_llm_response(
         "model": model,
         "max_tokens": 1024,
         "messages": system_messages,
-        "stream": true,
+        "stream": false,
     });
 
     let mut last_error = AppError::Llm("no attempts made".into());
@@ -131,57 +127,21 @@ pub async fn stream_llm_response(
             return Err(AppError::Llm(format!("API error {status}: {body}")));
         }
 
-        return parse_sse_stream(response, &mut on_text_delta).await;
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|err| AppError::Llm(format!("response JSON parse error: {err}")))?;
+
+        let text = json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+
+        debug!("OpenRouter response complete ({} chars)", text.len());
+        return Ok(text);
     }
 
     Err(last_error)
-}
-
-/// Reads the SSE byte stream, extracts `choices[0].delta.content` deltas,
-/// and assembles the full response text.
-async fn parse_sse_stream(
-    response: reqwest::Response,
-    on_text_delta: &mut impl FnMut(&str),
-) -> Result<String, AppError> {
-    let mut full_response_text = String::new();
-    let mut byte_stream = response.bytes_stream();
-    let mut buffer = String::new();
-
-    while let Some(chunk_result) = byte_stream.next().await {
-        let chunk =
-            chunk_result.map_err(|err| AppError::Llm(format!("stream error: {err}")))?;
-        let chunk_text = String::from_utf8_lossy(&chunk);
-        buffer.push_str(&chunk_text);
-
-        // SSE events are separated by double newlines
-        while let Some(boundary) = buffer.find("\n\n") {
-            let event_text = buffer[..boundary].to_string();
-            buffer = buffer[boundary + 2..].to_string();
-
-            for line in event_text.lines() {
-                let Some(json_data) = line.strip_prefix("data: ") else {
-                    continue;
-                };
-                if json_data.trim() == "[DONE]" {
-                    continue;
-                }
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
-                    if let Some(delta_content) =
-                        parsed["choices"][0]["delta"]["content"].as_str()
-                    {
-                        full_response_text.push_str(delta_content);
-                        on_text_delta(delta_content);
-                    }
-                }
-            }
-        }
-    }
-
-    debug!(
-        "OpenRouter response complete ({} chars)",
-        full_response_text.len()
-    );
-    Ok(full_response_text)
 }
 
 /// Builds the `content` array for a user message that includes screenshots and a transcript.
