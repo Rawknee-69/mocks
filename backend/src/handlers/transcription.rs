@@ -1,18 +1,18 @@
-/// Transcription bridge — connects AssemblyAI WebSocket to the pipeline state machine.
+/// Transcription bridge — connects Deepgram WebSocket to the pipeline state machine.
 ///
-/// Receives PCM16 audio from the frontend, forwards it to AssemblyAI, relays
+/// Receives PCM16 audio from the frontend, forwards it to Deepgram Nova-3, relays
 /// partial/final transcripts to the connection handler, and handles cancel/finalize.
-use crate::api::assemblyai::{self, TranscriptUpdate};
+use crate::api::deepgram::{self, TranscriptUpdate};
 use crate::error::AppError;
 use clicky_types::ServerMessage;
 use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc as async_mpsc;
 use tracing::{info, warn};
 
-/// Minimum PCM16 bytes to buffer before forwarding to AssemblyAI.
+/// Minimum PCM16 bytes to buffer before forwarding to Deepgram.
 const MIN_CHUNK_BYTES: usize = 3200;
 
-/// Starts a transcription session.
+/// Starts a Deepgram streaming transcription session.
 ///
 /// `audio_rx` — channel of raw PCM16 byte chunks from the frontend adapter.
 /// `server_tx` — channel to send `ServerMessage` events back to the connection task.
@@ -23,32 +23,19 @@ const MIN_CHUNK_BYTES: usize = 3200;
 pub async fn run_transcription_bridge(
     audio_rx: std_mpsc::Receiver<Vec<u8>>,
     server_tx: async_mpsc::Sender<ServerMessage>,
-    http_client: reqwest::Client,
+    _http_client: reqwest::Client,
     api_key: String,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-
-    let token = match assemblyai::fetch_temporary_streaming_token(&http_client, &api_key).await {
-        Ok(t) => t,
-        Err(err) => {
-            let _ = server_tx
-                .send(AppError::AssemblyAi(err.to_string()).into_server_message())
-                .await;
-            return;
-        }
-    };
-
-    let mut session = match assemblyai::StreamingTranscriptionSession::start(&token).await {
+    let mut session = match deepgram::StreamingTranscriptionSession::start(&api_key).await {
         Ok(s) => s,
         Err(err) => {
-            let _ = server_tx
-                .send(err.into_server_message())
-                .await;
+            let _ = server_tx.send(err.into_server_message()).await;
             return;
         }
     };
 
-    info!("AssemblyAI transcription session started");
+    info!("Deepgram transcription session started");
 
     let mut transcript_rx = session.take_transcript_receiver();
     let audio_sender = session.audio_sender();
@@ -83,7 +70,9 @@ pub async fn run_transcription_bridge(
             let message = match update {
                 TranscriptUpdate::Partial(text) => ServerMessage::PartialTranscript { text },
                 TranscriptUpdate::Final(text) => ServerMessage::FinalTranscript { text },
-                TranscriptUpdate::Error(message) => AppError::AssemblyAi(message).into_server_message(),
+                TranscriptUpdate::Error(message) => {
+                    AppError::Transcription(message).into_server_message()
+                }
             };
             if server_tx_for_transcripts.send(message).await.is_err() {
                 break;
@@ -96,7 +85,6 @@ pub async fn run_transcription_bridge(
     });
 
     // Wait for cancel (hotkey released), then drain remaining audio.
-    // The 500ms timeout prevents an infinite hang if the audio producer panics or stalls.
     let _ = cancel_rx.await;
     let drain_result = tokio::time::timeout(
         tokio::time::Duration::from_millis(500),
@@ -116,20 +104,16 @@ pub async fn run_transcription_bridge(
     info!("audio drained, requesting final transcript");
     let _ = session.request_final_transcript().await;
 
-    match tokio::time::timeout(
-        tokio::time::Duration::from_millis(1500),
-        final_rx,
-    )
-    .await
-    {
+    match tokio::time::timeout(tokio::time::Duration::from_millis(1500), final_rx).await {
         Ok(_) => {}
         Err(_) => {
             warn!("final transcript timeout — sending empty final");
             let _ = server_tx
-                .send(ServerMessage::FinalTranscript { text: String::new() })
+                .send(ServerMessage::FinalTranscript {
+                    text: String::new(),
+                })
                 .await;
             transcript_handle.abort();
         }
     }
 }
-

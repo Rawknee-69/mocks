@@ -8,14 +8,14 @@ use thiserror::Error;
 /// converts it to a `ServerMessage::Error` and sends it to the frontend.
 #[derive(Debug, Error)]
 pub enum AppError {
-    #[error("AssemblyAI error: {0}")]
-    AssemblyAi(String),
+    #[error("Transcription error: {0}")]
+    Transcription(String),
 
-    #[error("Claude API error: {0}")]
-    Claude(String),
+    #[error("LLM error: {0}")]
+    Llm(String),
 
-    #[error("ElevenLabs TTS error: {0}")]
-    ElevenLabs(String),
+    #[error("TTS error: {0}")]
+    Tts(String),
 
     #[allow(dead_code)]
     #[error("Computer Use API error: {0}")]
@@ -42,9 +42,9 @@ impl AppError {
     /// Maps this error to its `ErrorCode` category for the frontend.
     pub fn error_code(&self) -> ErrorCode {
         match self {
-            AppError::AssemblyAi(_) => ErrorCode::Transcription,
-            AppError::Claude(_) => ErrorCode::LlmPipeline,
-            AppError::ElevenLabs(_) => ErrorCode::Tts,
+            AppError::Transcription(_) => ErrorCode::Transcription,
+            AppError::Llm(_) => ErrorCode::LlmPipeline,
+            AppError::Tts(_) => ErrorCode::Tts,
             AppError::ComputerUse(_) => ErrorCode::ComputerUse,
             AppError::Screenshot(_) => ErrorCode::Screenshot,
             AppError::Websocket(_)

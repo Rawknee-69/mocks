@@ -1,16 +1,27 @@
-/// Claude API client with SSE streaming.
+/// OpenRouter chat completions API client with SSE streaming.
 ///
-/// Sends screenshots + transcript to Anthropic's Messages API and parses the
-/// SSE stream to extract text deltas progressively.
+/// Drop-in replacement for the former Anthropic Claude client.
+/// Uses the OpenAI-compatible endpoint with Nemotron Omni as the model.
+/// The public function signatures are kept identical to `claude.rs` so
+/// `handlers/llm_pipeline.rs` only needs import swaps.
+///
+/// Rate-limit handling:
+/// - A caller-supplied `Arc<Semaphore>` enforces the 20 RPM OpenRouter cap.
+/// - On HTTP 429, retries with exponential back-off (1 s → 2 s → 4 s, max 3 attempts).
 use crate::error::AppError;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
-use tracing::{debug, error};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tracing::{debug, error, warn};
 
-pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6";
+pub const DEFAULT_OPENROUTER_MODEL: &str = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
+const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+const MAX_RETRIES: u32 = 3;
 
 /// The system prompt that defines Clicky's personality and behaviour.
+/// Identical content to the former Claude prompt — only the constant name changes.
 pub const COMPANION_VOICE_RESPONSE_SYSTEM_PROMPT: &str = r#"you're clicky, a friendly always-on companion that lives in the user's system tray. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
 
 rules:
@@ -44,89 +55,137 @@ examples:
 - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:285,11:source control]"
 - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]""#;
 
-/// A screenshot to send to Claude for vision analysis.
-/// Re-exported from the shared types crate for use in backend API modules.
 pub use clicky_types::ScreenshotData;
 
-/// Streams a Claude response for the given messages and collects the full text.
+/// Streams an OpenRouter response for the given messages and collects the full text.
+///
+/// Acquires one permit from `rate_limiter` before the HTTP request and releases on
+/// drop, enforcing the OpenRouter 20 RPM cap across all concurrent users.
 ///
 /// `on_text_delta` is called with each incremental chunk as it arrives over SSE.
-pub async fn stream_claude_response(
+pub async fn stream_llm_response(
     http_client: &Client,
     api_key: &str,
     model: &str,
     system_prompt: &str,
     messages: Vec<serde_json::Value>,
+    rate_limiter: Arc<Semaphore>,
     mut on_text_delta: impl FnMut(&str),
 ) -> Result<String, AppError> {
+    let mut system_messages: Vec<serde_json::Value> =
+        vec![json!({"role": "system", "content": system_prompt})];
+    system_messages.extend(messages);
+
     let request_body = json!({
         "model": model,
         "max_tokens": 1024,
-        "system": system_prompt,
-        "messages": messages,
+        "messages": system_messages,
         "stream": true,
     });
 
-    debug!("sending Claude request to Anthropic API");
+    let mut last_error = AppError::Llm("no attempts made".into());
 
-    let response = http_client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|err| AppError::Claude(format!("network error: {err}")))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
+    for attempt in 0..MAX_RETRIES {
+        // Acquire permit — released when `_permit` is dropped at end of scope
+        let _permit = rate_limiter
+            .acquire()
             .await
-            .unwrap_or_else(|_| "unable to read error body".into());
-        error!("Claude API error {status}: {body}");
-        return Err(AppError::Claude(format!("API error {status}: {body}")));
+            .map_err(|_| AppError::Llm("rate limiter semaphore closed".into()))?;
+
+        debug!("sending OpenRouter request (attempt {})", attempt + 1);
+
+        let response = match http_client
+            .post(OPENROUTER_API_URL)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                last_error = AppError::Llm(format!("network error: {err}"));
+                break;
+            }
+        };
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let wait_secs = 1u64 << attempt; // 1 s, 2 s, 4 s
+            warn!(
+                "OpenRouter 429 on attempt {} — waiting {}s before retry",
+                attempt + 1,
+                wait_secs
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs)).await;
+            last_error = AppError::Llm("rate limit exceeded after retries".into());
+            continue;
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unable to read error body".into());
+            error!("OpenRouter API error {status}: {body}");
+            return Err(AppError::Llm(format!("API error {status}: {body}")));
+        }
+
+        return parse_sse_stream(response, &mut on_text_delta).await;
     }
 
+    Err(last_error)
+}
+
+/// Reads the SSE byte stream, extracts `choices[0].delta.content` deltas,
+/// and assembles the full response text.
+async fn parse_sse_stream(
+    response: reqwest::Response,
+    on_text_delta: &mut impl FnMut(&str),
+) -> Result<String, AppError> {
     let mut full_response_text = String::new();
     let mut byte_stream = response.bytes_stream();
     let mut buffer = String::new();
 
     while let Some(chunk_result) = byte_stream.next().await {
-        let chunk = chunk_result.map_err(|err| AppError::Claude(format!("stream error: {err}")))?;
+        let chunk =
+            chunk_result.map_err(|err| AppError::Llm(format!("stream error: {err}")))?;
         let chunk_text = String::from_utf8_lossy(&chunk);
         buffer.push_str(&chunk_text);
 
+        // SSE events are separated by double newlines
         while let Some(boundary) = buffer.find("\n\n") {
             let event_text = buffer[..boundary].to_string();
             buffer = buffer[boundary + 2..].to_string();
 
             for line in event_text.lines() {
-                if let Some(json_data) = line.strip_prefix("data: ") {
-                    if json_data == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
-                        if parsed["type"] == "content_block_delta"
-                            && parsed["delta"]["type"] == "text_delta"
-                        {
-                            if let Some(chunk) = parsed["delta"]["text"].as_str() {
-                                full_response_text.push_str(chunk);
-                                on_text_delta(chunk);
-                            }
-                        }
+                let Some(json_data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+                if json_data.trim() == "[DONE]" {
+                    continue;
+                }
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
+                    if let Some(delta_content) =
+                        parsed["choices"][0]["delta"]["content"].as_str()
+                    {
+                        full_response_text.push_str(delta_content);
+                        on_text_delta(delta_content);
                     }
                 }
             }
         }
     }
 
-    debug!("Claude response complete ({} chars)", full_response_text.len());
+    debug!(
+        "OpenRouter response complete ({} chars)",
+        full_response_text.len()
+    );
     Ok(full_response_text)
 }
 
-/// Builds the `content` array for a Claude message that includes screenshots and a transcript.
+/// Builds the `content` array for a user message that includes screenshots and a transcript.
+/// Uses OpenAI multimodal format: `image_url` blocks with base64 data URIs.
 pub fn build_vision_message_content(
     user_transcript: &str,
     screenshots: &[ScreenshotData],
@@ -138,13 +197,12 @@ pub fn build_vision_message_content(
             &base64::engine::general_purpose::STANDARD,
             &screenshot.jpeg_data,
         );
+        // Label as a text block before the image for context
         content_blocks.push(json!({ "type": "text", "text": screenshot.label }));
         content_blocks.push(json!({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/jpeg",
-                "data": base64_image,
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:image/jpeg;base64,{base64_image}"),
             },
         }));
     }

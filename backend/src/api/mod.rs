@@ -1,4 +1,4 @@
-pub mod assemblyai;
-pub mod claude;
 pub mod computer_use;
-pub mod elevenlabs;
+pub mod deepgram;
+pub mod deepgram_tts;
+pub mod openrouter;

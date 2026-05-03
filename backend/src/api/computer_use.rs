@@ -1,19 +1,27 @@
-/// Claude Computer Use API client — detects UI element coordinates.
+/// Vision-based UI element coordinate detection via Nemotron Omni on OpenRouter.
 ///
-/// Uses Claude's specialised pixel-counting training for significantly
-/// more accurate coordinate extraction than POINT tag parsing.
+/// Replaces the former Anthropic `computer_20251124` tool-use protocol with a
+/// structured JSON prompt. Nemotron's vision reasoning is purpose-built for GUI
+/// tasks; we send the screenshot and ask it to return a JSON coordinate object.
+///
+/// Public API (`ComputerUseCoordinate`, `detect_element_location`) is unchanged
+/// so `handlers/llm_pipeline.rs` needs no code changes.
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::json;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
-pub const COMPUTER_USE_MODEL: &str = "claude-sonnet-4-6";
+const COMPUTER_USE_MODEL: &str = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
+const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
-/// Anthropic-recommended resolutions for Computer Use.
-/// We pick the one closest to the display's aspect ratio to minimise distortion.
-const SUPPORTED_RESOLUTIONS: [(u32, u32, f64); 3] = [
-    (1024, 768, 1024.0 / 768.0),  // 4:3   legacy displays
-    (1280, 800, 1280.0 / 800.0),  // 16:10 MacBook / many laptops
-    (1366, 768, 1366.0 / 768.0),  // ~16:9 external monitors
+/// Nemotron supports full HD natively — added alongside the legacy CU resolutions.
+const SUPPORTED_RESOLUTIONS: [(u32, u32, f64); 4] = [
+    (1024, 768, 1024.0 / 768.0),   // 4:3
+    (1280, 800, 1280.0 / 800.0),   // 16:10
+    (1366, 768, 1366.0 / 768.0),   // ~16:9
+    (1920, 1080, 1920.0 / 1080.0), // 16:9 full HD
 ];
 
 /// Detected coordinate in display-local logical points.
@@ -23,9 +31,19 @@ pub struct ComputerUseCoordinate {
     pub display_local_y: f64,
 }
 
-/// Detects the screen location of a UI element using the Computer Use API.
+/// Detected element from the JSON response.
+#[derive(Deserialize)]
+struct ElementCoordinate {
+    x: Option<f64>,
+    y: Option<f64>,
+    #[allow(dead_code)]
+    label: Option<String>,
+}
+
+/// Detects the screen location of a UI element using Nemotron Omni vision reasoning.
 ///
 /// Returns `None` if no element was detected (conceptual question) or on any error.
+/// Acquires one permit from `rate_limiter` for the duration of the request.
 pub async fn detect_element_location(
     http_client: &Client,
     api_key: &str,
@@ -33,9 +51,10 @@ pub async fn detect_element_location(
     user_question: &str,
     display_width_points: f64,
     display_height_points: f64,
+    rate_limiter: Arc<Semaphore>,
 ) -> Option<ComputerUseCoordinate> {
     let (cu_width, cu_height) =
-        best_computer_use_resolution(display_width_points, display_height_points);
+        best_resolution(display_width_points, display_height_points);
 
     info!(
         "Computer Use: display {:.0}x{:.0} (ratio {:.3}), using resolution {}x{}",
@@ -48,13 +67,14 @@ pub async fn detect_element_location(
 
     let resized_jpeg = resize_screenshot(screenshot_jpeg, cu_width, cu_height)?;
 
-    let raw_coordinate = call_computer_use_api(
+    let raw_coordinate = call_vision_api(
         http_client,
         api_key,
         &resized_jpeg,
         user_question,
         cu_width,
         cu_height,
+        rate_limiter,
     )
     .await?;
 
@@ -76,7 +96,7 @@ pub async fn detect_element_location(
     })
 }
 
-fn best_computer_use_resolution(display_width: f64, display_height: f64) -> (u32, u32) {
+fn best_resolution(display_width: f64, display_height: f64) -> (u32, u32) {
     let display_ratio = display_width / display_height.max(1.0);
     let mut best_width = 1280u32;
     let mut best_height = 800u32;
@@ -94,65 +114,66 @@ fn best_computer_use_resolution(display_width: f64, display_height: f64) -> (u32
     (best_width, best_height)
 }
 
-async fn call_computer_use_api(
+async fn call_vision_api(
     http_client: &Client,
     api_key: &str,
     resized_jpeg: &[u8],
     user_question: &str,
     declared_width: u32,
     declared_height: u32,
+    rate_limiter: Arc<Semaphore>,
 ) -> Option<(f64, f64)> {
     let base64_screenshot =
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, resized_jpeg);
 
-    let user_prompt = format!(
-        "The user asked this question while looking at their screen: \"{user_question}\"\n\n\
-         Look at the screenshot. If there is a specific UI element (button, link, \
-         menu item, text field, icon, etc.) that the user should interact with or \
-         is asking about, click on that element.\n\n\
-         If the question is purely conceptual (e.g., \"what does HTML mean?\") and \
-         there's no specific element to point to, just respond with text saying \
-         \"no specific element\"."
+    let prompt = format!(
+        "Look at the screenshot ({}x{} pixels). \
+         The user asked: \"{user_question}\"\n\n\
+         If there is a specific UI element (button, link, menu item, text field, icon, etc.) \
+         that the user should interact with or is asking about, respond with ONLY valid JSON \
+         (no markdown, no explanation):\n\
+         {{\"x\": <integer_pixels>, \"y\": <integer_pixels>, \"label\": \"<short label>\"}}\n\n\
+         If the question is purely conceptual and there is no specific element to point to, \
+         respond with ONLY valid JSON:\n\
+         {{\"x\": null, \"y\": null, \"label\": \"none\"}}",
+        declared_width, declared_height,
     );
+
+    let payload_mb = (base64_screenshot.len() as f64 / 1_048_576.0) * 1.35;
+    debug!("Computer Use: sending ~{payload_mb:.1}MB (declared {declared_width}x{declared_height})");
 
     let request_body = json!({
         "model": COMPUTER_USE_MODEL,
-        "max_tokens": 256,
-        "tools": [
-            {
-                "type": "computer_20251124",
-                "name": "computer",
-                "display_width_px": declared_width,
-                "display_height_px": declared_height,
-            }
-        ],
+        "max_tokens": 64,
         "messages": [
             {
                 "role": "user",
                 "content": [
                     {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": base64_screenshot,
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:image/jpeg;base64,{base64_screenshot}"),
                         }
                     },
-                    { "type": "text", "text": user_prompt }
+                    { "type": "text", "text": prompt }
                 ]
             }
         ]
     });
 
-    let payload_mb = (base64_screenshot.len() as f64 / 1_048_576.0) * 1.35;
-    debug!("Computer Use: sending ~{payload_mb:.1}MB estimated (declared {declared_width}x{declared_height})");
+    // Acquire rate-limit permit
+    let _permit = match rate_limiter.acquire().await {
+        Ok(p) => p,
+        Err(_) => {
+            warn!("Computer Use: rate limiter semaphore closed");
+            return None;
+        }
+    };
 
     let response = match http_client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("anthropic-beta", "computer-use-2025-11-24")
-        .header("content-type", "application/json")
+        .post(OPENROUTER_API_URL)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
         .json(&request_body)
         .send()
         .await
@@ -167,7 +188,10 @@ async fn call_computer_use_api(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        warn!("Computer Use: API error {status}: {}", &body[..body.len().min(200)]);
+        warn!(
+            "Computer Use: API error {status}: {}",
+            &body[..body.len().min(200)]
+        );
         return None;
     }
 
@@ -179,31 +203,44 @@ async fn call_computer_use_api(
         }
     };
 
-    parse_coordinate_from_response(&body)
+    let raw_text = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    debug!("Computer Use raw response: {raw_text}");
+    parse_coordinate_from_text(&raw_text)
 }
 
-fn parse_coordinate_from_response(response: &serde_json::Value) -> Option<(f64, f64)> {
-    let content_blocks = response["content"].as_array()?;
+/// Strips optional markdown fences and parses the JSON coordinate object.
+fn parse_coordinate_from_text(text: &str) -> Option<(f64, f64)> {
+    // Strip ```json ... ``` or ``` ... ``` fences if present
+    let stripped = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
 
-    for block in content_blocks {
-        if block["type"].as_str() != Some("tool_use") {
-            continue;
+    let coordinate: ElementCoordinate = match serde_json::from_str(stripped) {
+        Ok(c) => c,
+        Err(err) => {
+            warn!("Computer Use: JSON parse error: {err} — text: {stripped}");
+            return None;
         }
+    };
 
-        let input = &block["input"];
-        let coordinate = input["coordinate"].as_array()?;
-        if coordinate.len() != 2 {
-            continue;
+    match (coordinate.x, coordinate.y) {
+        (Some(x), Some(y)) => {
+            info!("Computer Use: raw coordinate ({x:.0}, {y:.0})");
+            Some((x, y))
         }
-
-        let x = coordinate[0].as_f64()?;
-        let y = coordinate[1].as_f64()?;
-        info!("Computer Use: raw coordinate ({x:.0}, {y:.0})");
-        return Some((x, y));
+        _ => {
+            info!("Computer Use: no specific element detected (conceptual question)");
+            None
+        }
     }
-
-    info!("Computer Use: no specific element detected (conceptual question)");
-    None
 }
 
 fn resize_screenshot(jpeg_data: &[u8], target_width: u32, target_height: u32) -> Option<Vec<u8>> {
@@ -232,44 +269,39 @@ mod tests {
 
     #[test]
     fn best_resolution_for_16_10_display() {
-        let (w, h) = best_computer_use_resolution(2560.0, 1600.0);
+        let (w, h) = best_resolution(2560.0, 1600.0);
         assert_eq!((w, h), (1280, 800));
     }
 
     #[test]
     fn best_resolution_for_16_9_display() {
-        let (w, h) = best_computer_use_resolution(1920.0, 1080.0);
-        assert_eq!((w, h), (1366, 768));
+        let (w, h) = best_resolution(1920.0, 1080.0);
+        assert_eq!((w, h), (1920, 1080));
     }
 
     #[test]
     fn best_resolution_for_4_3_display() {
-        let (w, h) = best_computer_use_resolution(1024.0, 768.0);
+        let (w, h) = best_resolution(1024.0, 768.0);
         assert_eq!((w, h), (1024, 768));
     }
 
     #[test]
-    fn parse_tool_use_response() {
-        let response = serde_json::json!({
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": "toolu_123",
-                    "name": "computer",
-                    "input": { "action": "left_click", "coordinate": [640, 400] }
-                }
-            ]
-        });
-        let coord = parse_coordinate_from_response(&response).unwrap();
+    fn parse_coordinate_json() {
+        let text = r#"{"x": 640, "y": 400, "label": "save button"}"#;
+        let coord = parse_coordinate_from_text(text).unwrap();
         assert_eq!(coord, (640.0, 400.0));
     }
 
     #[test]
-    fn parse_text_only_response() {
-        let response = serde_json::json!({
-            "content": [{ "type": "text", "text": "no specific element" }]
-        });
-        assert!(parse_coordinate_from_response(&response).is_none());
+    fn parse_coordinate_with_markdown_fence() {
+        let text = "```json\n{\"x\": 320, \"y\": 200, \"label\": \"menu\"}\n```";
+        let coord = parse_coordinate_from_text(text).unwrap();
+        assert_eq!(coord, (320.0, 200.0));
+    }
+
+    #[test]
+    fn parse_null_coordinate() {
+        let text = r#"{"x": null, "y": null, "label": "none"}"#;
+        assert!(parse_coordinate_from_text(text).is_none());
     }
 }
-

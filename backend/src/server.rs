@@ -5,19 +5,26 @@
 /// One connection at a time: a new WebSocket connection resets all pipeline state.
 /// The previous connection's tasks are not explicitly cancelled but will fail
 /// when they try to send on the closed channel.
+use crate::core::context_compactor;
 use crate::error::AppError;
 use crate::handlers::{llm_pipeline, transcription};
 use clicky_types::{ClientMessage, DisplayInfo, ScreenshotData, ServerMessage};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_tungstenite::{
     accept_async_with_config,
     tungstenite::{protocol::WebSocketConfig, Message},
 };
 use tracing::{error, info, warn};
+
+/// OpenRouter RPM cap. One permit is consumed per LLM or Computer Use request.
+const OPENROUTER_RPM_CAP: usize = 20;
+/// Deepgram concurrent TTS streams cap.
+const DEEPGRAM_TTS_CONCURRENT_CAP: usize = 45;
 
 /// Binds on `127.0.0.1:port` and accepts incoming connections.
 pub async fn run(port: u16) {
@@ -25,11 +32,19 @@ pub async fn run(port: u16) {
     let listener = TcpListener::bind(addr).await.expect("failed to bind port");
     info!("WebSocket server listening on ws://{addr}");
 
+    // Global semaphores shared across all concurrent connections
+    let llm_rate_limiter: Arc<Semaphore> = Arc::new(Semaphore::new(OPENROUTER_RPM_CAP));
+    let tts_rate_limiter: Arc<Semaphore> = Arc::new(Semaphore::new(DEEPGRAM_TTS_CONCURRENT_CAP));
+
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
                 info!("new connection from {peer_addr}");
-                tokio::spawn(handle_connection(stream));
+                tokio::spawn(handle_connection(
+                    stream,
+                    Arc::clone(&llm_rate_limiter),
+                    Arc::clone(&tts_rate_limiter),
+                ));
             }
             Err(err) => {
                 error!("accept error: {err}");
@@ -39,7 +54,11 @@ pub async fn run(port: u16) {
 }
 
 /// Handles a single WebSocket connection end-to-end.
-async fn handle_connection(tcp_stream: TcpStream) {
+async fn handle_connection(
+    tcp_stream: TcpStream,
+    llm_rate_limiter: Arc<Semaphore>,
+    _tts_rate_limiter: Arc<Semaphore>,
+) {
     let ws_config = WebSocketConfig::default()
         .max_message_size(Some(32 * 1024 * 1024))
         .max_frame_size(Some(32 * 1024 * 1024));
@@ -54,19 +73,15 @@ async fn handle_connection(tcp_stream: TcpStream) {
     let (ws_sink, mut ws_source) = ws_stream.split();
 
     // All `ServerMessage` values flow through this channel.
-    // The forwarder task serialises them to JSON and writes them to the WebSocket.
-    // The pipeline trigger also reads from a cloned sender to detect FinalTranscript.
     let (server_tx, server_rx) = mpsc::channel::<ServerMessage>(64);
-
-    // Spawn the WebSocket forwarder
     let forwarder_handle = tokio::spawn(forward_to_websocket(server_rx, ws_sink));
 
     // Load API keys from environment once per connection
-    let assemblyai_key = std::env::var("ASSEMBLYAI_API_KEY").ok();
-    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok();
-    let elevenlabs_key = std::env::var("ELEVENLABS_API_KEY").ok();
-    let elevenlabs_voice = std::env::var("ELEVENLABS_VOICE_ID").ok();
-    let tts_enabled = elevenlabs_key.is_some();
+    let deepgram_key = std::env::var("DEEPGRAM_API_KEY").ok();
+    let openrouter_key = std::env::var("OPENROUTER_API_KEY").ok();
+    let deepgram_tts_voice = std::env::var("DEEPGRAM_TTS_VOICE").ok();
+    // TTS is enabled whenever a Deepgram key is present (same key for STT and TTS)
+    let tts_enabled = deepgram_key.is_some();
 
     let http_client = reqwest::Client::new();
 
@@ -121,7 +136,7 @@ async fn handle_connection(tcp_stream: TcpStream) {
                     &mut audio_tx,
                     &mut cursor_position,
                     &mut pending_screenshots,
-                    &assemblyai_key,
+                    &deepgram_key,
                     &http_client,
                     pipeline_tx.clone(),
                     &server_tx,
@@ -147,20 +162,29 @@ async fn handle_connection(tcp_stream: TcpStream) {
                     };
 
                     if !transcript.is_empty() {
-                        if let Some(ref anthropic_api_key) = anthropic_key {
+                        if let Some(ref or_key) = openrouter_key {
+                            // Compact history before passing it to the pipeline
+                            context_compactor::maybe_compact(
+                                &mut conversation_history,
+                                &http_client,
+                                or_key,
+                                Arc::clone(&llm_rate_limiter),
+                            )
+                            .await;
+
                             let config = llm_pipeline::LlmPipelineConfig {
-                                anthropic_api_key: anthropic_api_key.clone(),
-                                elevenlabs_api_key: elevenlabs_key.clone(),
-                                elevenlabs_voice_id: elevenlabs_voice.clone(),
+                                openrouter_api_key: or_key.clone(),
+                                deepgram_api_key: deepgram_key.clone(),
+                                deepgram_tts_voice: deepgram_tts_voice.clone(),
                                 tts_enabled,
+                                llm_rate_limiter: Arc::clone(&llm_rate_limiter),
                             };
                             let client = http_client.clone();
                             let tx = pipeline_tx.clone();
                             let history: Vec<(String, String)> =
                                 conversation_history.iter().cloned().collect();
-                            let (screenshots, display_infos) = pending_screenshots
-                                .take()
-                                .unwrap_or_default();
+                            let (screenshots, display_infos) =
+                                pending_screenshots.take().unwrap_or_default();
                             tokio::spawn(llm_pipeline::run_llm_pipeline(
                                 client, config, transcript, screenshots, display_infos, history, tx,
                             ));
@@ -171,8 +195,9 @@ async fn handle_connection(tcp_stream: TcpStream) {
                 // Track LlmResponse to update conversation history
                 if let ServerMessage::LlmResponse { ref spoken_text, .. } = message {
                     if let Some(ref transcript) = last_transcript {
-                        conversation_history.push_back((transcript.clone(), spoken_text.clone()));
-                        // Keep last 10 exchanges
+                        conversation_history
+                            .push_back((transcript.clone(), spoken_text.clone()));
+                        // Keep last 10 exchanges (compactor handles token pressure)
                         if conversation_history.len() > 10 {
                             conversation_history.pop_front();
                         }
@@ -197,7 +222,7 @@ async fn handle_client_message(
     audio_tx: &mut Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     cursor_position: &mut (f32, f32),
     pending_screenshots: &mut Option<(Vec<ScreenshotData>, Vec<DisplayInfo>)>,
-    assemblyai_key: &Option<String>,
+    deepgram_key: &Option<String>,
     http_client: &reqwest::Client,
     pipeline_tx: mpsc::Sender<ServerMessage>,
     server_tx: &mpsc::Sender<ServerMessage>,
@@ -211,9 +236,12 @@ async fn handle_client_message(
             }
             *audio_tx = None;
 
-            let Some(api_key) = assemblyai_key.clone() else {
+            let Some(api_key) = deepgram_key.clone() else {
                 let _ = server_tx
-                    .send(AppError::Config("ASSEMBLYAI_API_KEY not set".into()).into_server_message())
+                    .send(
+                        AppError::Config("DEEPGRAM_API_KEY not set".into())
+                            .into_server_message(),
+                    )
                     .await;
                 return;
             };

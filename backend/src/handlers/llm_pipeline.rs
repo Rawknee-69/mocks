@@ -1,29 +1,32 @@
-/// LLM pipeline handler — Claude vision + Computer Use + TTS.
+/// LLM pipeline handler — OpenRouter vision + Computer Use + TTS.
 ///
 /// Screenshots arrive from the frontend over WebSocket. The backend no longer captures them.
-use crate::api::{claude, computer_use};
+use crate::api::{computer_use, openrouter};
 use crate::core::{coordinate_mapper, point_parser};
 use crate::error::AppError;
 use crate::handlers::tts;
 use clicky_types::{DisplayInfo, ScreenshotData, ServerMessage};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
 
 pub struct LlmPipelineConfig {
-    pub anthropic_api_key: String,
-    pub elevenlabs_api_key: Option<String>,
-    pub elevenlabs_voice_id: Option<String>,
+    pub openrouter_api_key: String,
+    pub deepgram_api_key: Option<String>,
+    pub deepgram_tts_voice: Option<String>,
     pub tts_enabled: bool,
+    /// Shared 20-permit semaphore enforcing the OpenRouter RPM cap.
+    pub llm_rate_limiter: Arc<Semaphore>,
 }
 
 /// Runs the full LLM pipeline for a completed transcript.
 ///
-/// 1. Uses screenshots provided by the frontend
-/// 2. Calls Claude vision API (streaming)
-/// 3. Parses POINT tag
-/// 4. Spawns ElevenLabs TTS in parallel with Computer Use
-/// 5. Runs Computer Use for precise coordinates
-/// 6. Sends `ServerMessage::LlmResponse`
+/// 1. Uses screenshots provided by the frontend.
+/// 2. Calls OpenRouter vision API (streaming, Nemotron Omni).
+/// 3. Parses POINT tag from response.
+/// 4. Spawns Deepgram TTS in parallel with Computer Use coordinate detection.
+/// 5. Runs Computer Use for precise coordinates.
+/// 6. Sends `ServerMessage::LlmResponse`.
 pub async fn run_llm_pipeline(
     http_client: reqwest::Client,
     config: LlmPipelineConfig,
@@ -36,7 +39,10 @@ pub async fn run_llm_pipeline(
     if screenshots.is_empty() {
         warn!("no screenshots received from frontend, skipping pipeline");
         let _ = server_tx
-            .send(AppError::Screenshot("no screenshots received from frontend".into()).into_server_message())
+            .send(
+                AppError::Screenshot("no screenshots received from frontend".into())
+                    .into_server_message(),
+            )
             .await;
         return;
     }
@@ -49,19 +55,19 @@ pub async fn run_llm_pipeline(
         messages.push(serde_json::json!({"role": "assistant", "content": assistant_text}));
     }
 
-    let user_content =
-        claude::build_vision_message_content(&transcript, &screenshots);
+    let user_content = openrouter::build_vision_message_content(&transcript, &screenshots);
     messages.push(serde_json::json!({"role": "user", "content": user_content}));
 
-    let model = claude::DEFAULT_CLAUDE_MODEL;
-    info!("sending to Claude ({model})...");
+    let model = openrouter::DEFAULT_OPENROUTER_MODEL;
+    info!("sending to OpenRouter ({model})...");
 
-    let result = claude::stream_claude_response(
+    let result = openrouter::stream_llm_response(
         &http_client,
-        &config.anthropic_api_key,
+        &config.openrouter_api_key,
         model,
-        claude::COMPANION_VOICE_RESPONSE_SYSTEM_PROMPT,
+        openrouter::COMPANION_VOICE_RESPONSE_SYSTEM_PROMPT,
         messages,
+        Arc::clone(&config.llm_rate_limiter),
         |_chunk| {},
     )
     .await;
@@ -78,22 +84,15 @@ pub async fn run_llm_pipeline(
     let parsed = point_parser::parse_claude_response(&response_text);
 
     if config.tts_enabled && !parsed.spoken_text.is_empty() {
-        if let Some(ref elevenlabs_api_key) = config.elevenlabs_api_key {
+        if let Some(ref deepgram_api_key) = config.deepgram_api_key {
             let tts_client = http_client.clone();
-            let tts_key = elevenlabs_api_key.clone();
-            let tts_voice = config.elevenlabs_voice_id.clone();
+            let tts_key = deepgram_api_key.clone();
+            let tts_voice = config.deepgram_tts_voice.clone();
             let tts_text = parsed.spoken_text.clone();
             let tts_tx = server_tx.clone();
 
             tokio::spawn(async move {
-                tts::run_tts(
-                    &tts_client,
-                    &tts_key,
-                    tts_voice.as_deref(),
-                    tts_text,
-                    tts_tx,
-                )
-                .await;
+                tts::run_tts(&tts_client, &tts_key, tts_voice.as_deref(), tts_text, tts_tx).await;
             });
         }
     }
@@ -102,23 +101,25 @@ pub async fn run_llm_pipeline(
         &http_client,
         &screenshots,
         &display_infos,
-        &config.anthropic_api_key,
+        &config.openrouter_api_key,
         &transcript,
+        Arc::clone(&config.llm_rate_limiter),
     )
     .await;
 
     let final_coordinate = if let Some(coord) = computer_use_coordinate {
         Some(coord)
     } else if let Some(ref pointing) = parsed.pointing {
-        coordinate_mapper::find_target_display(pointing.screen_number, &display_infos)
-            .map(|display| {
+        coordinate_mapper::find_target_display(pointing.screen_number, &display_infos).map(
+            |display| {
                 let global = coordinate_mapper::map_screenshot_pixels_to_global(
                     pointing.screenshot_pixel_x,
                     pointing.screenshot_pixel_y,
                     display,
                 );
                 (global.x, global.y)
-            })
+            },
+        )
     } else {
         None
     };
@@ -136,8 +137,9 @@ async fn detect_computer_use_coordinate(
     http_client: &reqwest::Client,
     screenshots: &[ScreenshotData],
     display_infos: &[DisplayInfo],
-    anthropic_api_key: &str,
+    openrouter_api_key: &str,
     transcript: &str,
+    rate_limiter: Arc<Semaphore>,
 ) -> Option<(f64, f64)> {
     let cursor_display = display_infos.iter().find(|d| d.is_cursor_display)?;
     let cursor_screenshot = screenshots
@@ -146,15 +148,16 @@ async fn detect_computer_use_coordinate(
         .find(|(_, d)| d.is_cursor_display)
         .map(|(s, _)| s)?;
 
-    info!("running Computer Use API for precise coordinate detection");
+    info!("running Computer Use for precise coordinate detection");
 
     let coordinate = computer_use::detect_element_location(
         http_client,
-        anthropic_api_key,
+        openrouter_api_key,
         &cursor_screenshot.jpeg_data,
         transcript,
         cursor_display.display_width_points,
         cursor_display.display_height_points,
+        rate_limiter,
     )
     .await?;
 
@@ -166,8 +169,6 @@ async fn detect_computer_use_coordinate(
 
 #[cfg(debug_assertions)]
 fn log_debug_screenshots(screenshots: &[ScreenshotData], display_infos: &[DisplayInfo]) {
-    // Requires CLICKY_DEBUG_SCREENSHOTS=1 so screenshots are never written unintentionally.
-    // Even in debug builds, /tmp is world-readable on Linux, so we guard behind an explicit opt-in.
     if std::env::var("CLICKY_DEBUG_SCREENSHOTS").as_deref() != Ok("1") {
         return;
     }
@@ -191,9 +192,12 @@ fn log_debug_screenshots(screenshots: &[ScreenshotData], display_infos: &[Displa
     for (i, d) in display_infos.iter().enumerate() {
         info!(
             "debug display {i}: origin=({},{}) size={}x{} screenshot={}x{} cursor={}",
-            d.global_origin_x, d.global_origin_y,
-            d.display_width_points, d.display_height_points,
-            d.screenshot_width_pixels, d.screenshot_height_pixels,
+            d.global_origin_x,
+            d.global_origin_y,
+            d.display_width_points,
+            d.display_height_points,
+            d.screenshot_width_pixels,
+            d.screenshot_height_pixels,
             d.is_cursor_display,
         );
     }
