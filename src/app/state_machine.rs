@@ -40,14 +40,6 @@ pub enum VoiceStateTransition {
     Error,
 }
 
-/// Parsed from Claude's [POINT:x,y:label:screenN] tag.
-#[derive(Debug, Clone)]
-pub struct PointingInstruction {
-    pub screenshot_x: f64,
-    pub screenshot_y: f64,
-    pub screen_number: Option<u32>,
-}
-
 impl VoiceState {
     /// Applies a transition and returns the new state, or None if the
     /// transition is invalid for the current state.

@@ -66,6 +66,9 @@ pub struct OverlayApp {
     pub last_mouse_pos: (f32, f32),
     // Last cursor position actually sent to the backend — used for delta filtering.
     pub last_sent_cursor_pos: (f32, f32),
+    // Mouse position at the moment the hotkey was released — used to drift-compensate
+    // CU coordinates, which are anchored to the screenshot taken at release time.
+    pub mouse_pos_at_release: (f32, f32),
     // Exponentially smoothed mouse velocity (pixels/second) used for prediction.
     pub mouse_velocity: (f32, f32),
     // Per-second timing diagnostics
@@ -609,6 +612,8 @@ impl OverlayApp {
             PushToTalkTransition::Released => {
                 log::info!("Push-to-talk: RELEASED");
                 self.mic_capture.stop();
+                // Snapshot mouse position so PipelineReady can drift-compensate.
+                self.mouse_pos_at_release = self.cursor_tracker.get_position();
 
                 if self.simulation_mode {
                     if let Some(s) =
@@ -688,81 +693,83 @@ impl OverlayApp {
                 self.render_state.voice_state = self.voice_state;
                 self.processing_since = None;
             }
-            UiEvent::LlmResponse {
-                spoken_text,
-                pointing_instruction,
-                display_infos,
-                computer_use_global_coordinate,
-            } => {
+            UiEvent::PipelineReady { spoken_text, mp3_bytes, coordinate, display_infos } => {
                 if self.voice_state != VoiceState::Processing {
                     return;
                 }
-                log::info!("LLM response: {}", spoken_text);
+                log::info!("PipelineReady: {}", spoken_text);
 
                 if let Some(s) = self.voice_state.apply(VoiceStateTransition::ResponseReady) {
                     self.voice_state = s;
                     self.render_state.voice_state = self.voice_state;
                 }
 
-                if let Some((gx, gy)) = computer_use_global_coordinate {
+                // Drift-compensate: CU coordinates are anchored to the screenshot taken at
+                // hotkey release. Add the delta between then and now so the cursor targets the
+                // current visual position of the element.
+                let current = self.cursor_tracker.get_position();
+                let drift_x = (current.0 - self.mouse_pos_at_release.0) as f64;
+                let drift_y = (current.1 - self.mouse_pos_at_release.1) as f64;
+
+                let adjusted_coord = coordinate.and_then(|(cx, cy)| {
+                    let ax = cx + drift_x;
+                    let ay = cy + drift_y;
+                    // Reject NaN, Inf, or anything outside the overlay bounds.
+                    if ax.is_finite()
+                        && ay.is_finite()
+                        && ax >= 0.0
+                        && ay >= 0.0
+                        && ax < self.screen_w as f64
+                        && ay < self.screen_h as f64
+                    {
+                        Some((ax, ay))
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some((gx, gy)) = adjusted_coord {
                     self.render_state.start_flight_to(
                         gx - self.overlay_x as f64,
                         gy - self.overlay_y as f64,
                         spoken_text.clone(),
                     );
-                } else if let Some(ref instruction) = pointing_instruction {
-                    let target = crate::core::coordinate_mapper::find_target_display(
-                        instruction.screen_number,
-                        &display_infos,
-                    );
-                    if let Some(display) = target {
-                        let coord = crate::core::coordinate_mapper::map_screenshot_pixels_to_global_display_coordinates(
-                            instruction.screenshot_x,
-                            instruction.screenshot_y,
-                            display,
-                        );
-                        self.render_state.start_flight_to(
-                            coord.x - self.overlay_x as f64,
-                            coord.y - self.overlay_y as f64,
-                            spoken_text.clone(),
-                        );
-                    }
                 }
 
-                let is_pointing =
-                    computer_use_global_coordinate.is_some() || pointing_instruction.is_some();
+                let is_pointing = adjusted_coord.is_some();
                 self.render_state.speech_bubble_text =
                     crate::core::bubble_text::pick_bubble_phrase(is_pointing);
 
-                self.responding_since = Some(Instant::now());
-                self.cu_coordinate_pending = true;
-                self.cu_pending_since = Some(Instant::now());
-                self.claude_pipeline_active = false;
-                self.processing_since = None;
-            }
-            UiEvent::TtsAudio(mp3_bytes) => {
-                if let Some(p) = &mut self.audio_player {
-                    p.play_mp3(mp3_bytes);
-                    log::info!("TTS playback started");
-                }
-            }
-            UiEvent::TtsError(err) => {
-                log::warn!("TTS failed: {} — falling back to espeak-ng", err);
-                let spoken = self.render_state.speech_bubble_text.clone();
-                if !spoken.is_empty() {
-                    // Cap length and strip null bytes as defence-in-depth before passing to a subprocess.
-                    let spoken_clean: String = spoken
+                // Play TTS — empty mp3_bytes means TTS was disabled or failed.
+                if mp3_bytes.is_empty() {
+                    log::warn!("TTS unavailable — falling back to espeak-ng");
+                    let spoken_clean: String = spoken_text
                         .chars()
                         .filter(|&c| c != '\0')
                         .take(500)
                         .collect();
-                    std::thread::spawn(move || {
-                        // .status() blocks until the child exits, preventing a zombie process.
-                        let _ = std::process::Command::new("espeak-ng")
-                            .arg(&spoken_clean)
-                            .status();
-                    });
+                    if !spoken_clean.is_empty() {
+                        std::thread::spawn(move || {
+                            let _ = std::process::Command::new("espeak-ng")
+                                .arg(&spoken_clean)
+                                .status();
+                        });
+                    }
+                } else if let Some(p) = &mut self.audio_player {
+                    p.play_mp3(mp3_bytes);
+                    log::info!("TTS playback started");
                 }
+
+                self.responding_since = Some(std::time::Instant::now());
+                self.cu_coordinate_pending = false;
+                self.cu_pending_since = None;
+                self.claude_pipeline_active = false;
+                self.processing_since = None;
+                let _ = display_infos; // consumed by coordinate mapping above
+            }
+            UiEvent::TtsError(err) => {
+                // TtsError is no longer produced by the new pipeline; kept for forward-compat.
+                log::warn!("TTS error (legacy): {err}");
             }
             UiEvent::PipelineError(err) => {
                 log::error!("Pipeline error: {}", err);
@@ -770,20 +777,6 @@ impl OverlayApp {
                 self.render_state.voice_state = self.voice_state;
                 self.processing_since = None;
                 self.claude_pipeline_active = false;
-            }
-            UiEvent::ComputerUseCoordinate(gx, gy) => {
-                // Only act when still in Responding — if the user pressed hotkey again,
-                // we're already in a new state and this stale coordinate must be ignored.
-                if self.voice_state != VoiceState::Responding {
-                    return;
-                }
-                log::info!("Computer Use coordinate received: ({gx:.1}, {gy:.1})");
-                self.cu_coordinate_pending = false;
-                self.cu_pending_since = None;
-                let local_x = gx - self.overlay_x as f64;
-                let local_y = gy - self.overlay_y as f64;
-                let bubble_text = self.render_state.speech_bubble_text.clone();
-                self.render_state.start_flight_to(local_x, local_y, bubble_text);
             }
         }
     }

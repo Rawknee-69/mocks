@@ -229,21 +229,13 @@ fn server_message_to_ui_event(msg: ServerMessage) -> Option<UiEvent> {
             None
         }
 
-        ServerMessage::LlmResponse { spoken_text, coordinate, display_infos } => {
-            Some(UiEvent::LlmResponse {
+        ServerMessage::PipelineReady { spoken_text, mp3_bytes, coordinate, display_infos } => {
+            Some(UiEvent::PipelineReady {
                 spoken_text,
-                pointing_instruction: None,
+                mp3_bytes,
+                coordinate,
                 display_infos,
-                computer_use_global_coordinate: coordinate,
             })
-        }
-
-        ServerMessage::TtsAudio { mp3_bytes } => {
-            Some(UiEvent::TtsAudio(mp3_bytes))
-        }
-
-        ServerMessage::ComputerUseCoordinate { x, y } => {
-            Some(UiEvent::ComputerUseCoordinate(x, y))
         }
 
         ServerMessage::Error { code, message } => {

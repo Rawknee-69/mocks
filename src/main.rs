@@ -164,6 +164,7 @@ fn main() {
         },
         last_mouse_pos: (0.0, 0.0),
         last_sent_cursor_pos: (0.0, 0.0),
+        mouse_pos_at_release: (0.0, 0.0),
         mouse_velocity: (0.0, 0.0),
         diag_last_log_at: Instant::now(),
         diag_frame_intervals_ms: Vec::with_capacity(600),

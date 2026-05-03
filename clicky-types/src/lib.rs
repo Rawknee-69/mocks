@@ -56,26 +56,21 @@ pub enum ServerMessage {
     /// Incremental LLM text chunk from SSE streaming.
     LlmTextDelta { chunk: String },
 
-    /// Full LLM response once the pipeline completes.
-    LlmResponse {
-        /// Text that will be spoken aloud via TTS.
+    /// All pipeline results delivered atomically once LLM + CU + TTS all finish.
+    /// Replaces the old LlmResponse + ComputerUseCoordinate + TtsAudio triple.
+    PipelineReady {
+        /// Text that was spoken aloud (also used for the speech bubble).
         spoken_text: String,
 
-        /// POINT-tag fallback coordinate parsed from the LLM text.
-        /// Computer Use coordinate is delivered later via `ComputerUseCoordinate`
-        /// so TTS playback is not blocked by the Computer Use round-trip.
+        /// Raw MP3 bytes from Deepgram TTS.  Empty Vec if TTS was disabled or failed.
+        mp3_bytes: Vec<u8>,
+
+        /// Cursor target: CU result if found, POINT-tag fallback otherwise, or None.
         coordinate: Option<(f64, f64)>,
 
-        /// Metadata for every captured display (used for POINT-tag fallback mapping).
+        /// Metadata for every captured display (used for coordinate mapping).
         display_infos: Vec<DisplayInfo>,
     },
-
-    /// Raw MP3 audio bytes synthesized by ElevenLabs TTS.
-    TtsAudio { mp3_bytes: Vec<u8> },
-
-    /// Precise cursor target from Computer Use — arrives after `LlmResponse` so TTS is not delayed.
-    /// The frontend starts the cursor flight when this is received.
-    ComputerUseCoordinate { x: f64, y: f64 },
 
     /// A pipeline stage failed. The frontend should return to Idle state.
     Error {

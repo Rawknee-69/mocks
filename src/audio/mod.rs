@@ -1,7 +1,6 @@
 pub mod capture;
 pub mod playback;
 
-use crate::app::state_machine::PointingInstruction;
 use clicky_types::DisplayInfo;
 use std::fmt;
 
@@ -10,22 +9,19 @@ pub enum UiEvent {
     PartialTranscript(String),
     FinalTranscript(String),
     TranscriptionError(String),
-    LlmResponse {
+    /// All pipeline results delivered atomically — replaces the old LlmResponse +
+    /// ComputerUseCoordinate + TtsAudio triple.
+    PipelineReady {
         spoken_text: String,
-        pointing_instruction: Option<PointingInstruction>,
+        /// Raw MP3 bytes from Deepgram TTS.  Empty if TTS was disabled or failed.
+        mp3_bytes: Vec<u8>,
+        /// Cursor target: CU result if found, POINT-tag fallback otherwise, or None.
+        coordinate: Option<(f64, f64)>,
         display_infos: Vec<DisplayInfo>,
-        /// Pre-computed global coordinate from Computer Use API (more precise than POINT tags).
-        /// When present, this takes priority over the POINT tag coordinate.
-        computer_use_global_coordinate: Option<(f64, f64)>,
     },
     PipelineError(String),
-    /// MP3 bytes received from ElevenLabs TTS, ready for playback.
-    TtsAudio(Vec<u8>),
     /// TTS synthesis failed — caller should fall back to espeak-ng.
     TtsError(String),
-    /// Precise cursor target from Computer Use, arrives after LlmResponse.
-    /// The render loop starts the cursor flight on this event.
-    ComputerUseCoordinate(f64, f64),
 }
 
 /// Audio subsystem errors. All are recoverable — the app continues without audio.
