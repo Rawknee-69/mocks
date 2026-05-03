@@ -39,8 +39,6 @@ const ZOOM_FRACTION: f64 = 0.25;
 
 const JPEG_QUALITY: u8 = 85;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
-const MAX_ATTEMPTS: u32 = 3;
-const BACKOFF_BASE_MS: u64 = 600;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -452,7 +450,7 @@ fn clamp_to_dims(x: f64, y: f64, dims: ModelDims) -> (f64, f64) {
 
 // ─── Network ──────────────────────────────────────────────────────────────────
 
-/// Accepts a fully-built prompt string.  Never builds prompts internally.
+/// Single-attempt coordinate call.  On any failure (network, parse) returns `None`.
 async fn call_with_retry(
     client: &Client,
     provider: &Provider,
@@ -461,39 +459,14 @@ async fn call_with_retry(
     rate_limiter: Arc<Semaphore>,
     pass: u8,
 ) -> Option<(f64, f64)> {
-    for attempt in 0..MAX_ATTEMPTS {
-        if attempt > 0 {
-            let base = BACKOFF_BASE_MS * (1u64 << attempt.min(4));
-            let jitter = subsec_jitter_ms(base / 2);
-            tokio::time::sleep(Duration::from_millis(base + jitter)).await;
-            warn!("ComputerUse: retry {}/{MAX_ATTEMPTS}", attempt + 1);
-        }
-
-        match call_once(client, provider, jpeg, prompt, Arc::clone(&rate_limiter), pass, attempt + 1).await {
-            Ok(Some(coord)) => return Some(coord),
-            Ok(None) => {
-                // Valid null — element genuinely absent. Never retry.
-                return None;
-            }
-            Err(()) => {
-                // Network / parse failure → loop for retry.
-            }
+    match call_once(client, provider, jpeg, prompt, rate_limiter, pass, 1).await {
+        Ok(Some(coord)) => Some(coord),
+        Ok(None) => None,
+        Err(()) => {
+            warn!("ComputerUse: pass {pass} attempt failed — returning None");
+            None
         }
     }
-
-    warn!("ComputerUse: all {MAX_ATTEMPTS} attempts exhausted");
-    None
-}
-
-fn subsec_jitter_ms(max_ms: u64) -> u64 {
-    if max_ms == 0 {
-        return 0;
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    (nanos as u64) % max_ms
 }
 
 async fn call_once(
@@ -576,6 +549,7 @@ async fn call_once_openrouter(
     }
 
     debug!("ComputerUse [pass{pass} attempt{attempt}] raw: {raw}");
+    println!("RAW CU RESPONSE: {}", raw);
     write_cu_debug(pass, attempt, jpeg, prompt, &raw);
 
     match parse_coordinate(&raw) {
@@ -607,8 +581,11 @@ async fn call_once_gemini(
             ]
         }],
         "generationConfig": {
-            "maxOutputTokens": 512,
-            "temperature": 0.0
+            "maxOutputTokens": 256,
+            "temperature": 0.0,
+            "thinkingConfig": {
+                "thinkingBudget": 0
+            }
         }
     });
 
@@ -649,6 +626,7 @@ async fn call_once_gemini(
     }
 
     debug!("ComputerUse (Gemini) [pass{pass} attempt{attempt}] raw: {raw}");
+    println!("RAW CU RESPONSE: {}", raw);
     write_cu_debug(pass, attempt, jpeg, prompt, &raw);
 
     match parse_coordinate(&raw) {
@@ -860,14 +838,24 @@ fn write_cu_debug(pass: u8, attempt: u32, jpeg: &[u8], prompt: &str, response: &
 
 /// Multi-strategy coordinate extractor.
 ///
+/// 0. Safe substring extraction: find first `{` and last `}`, parse with serde_json.
 /// 1. Strip `<think>…</think>` reasoning blocks (Nemotron ALWAYS emits these).
 /// 2. Direct JSON parse on the stripped text.
 /// 3. Strip markdown fences, retry.
 /// 4. Extract the last balanced `{…}` span (handles JSON embedded in prose).
+/// 5. Tolerant regex extraction — handles truncated JSON like `{"x": 1200, "y": 60, "label": "`.
 ///
 /// Returns `NoElement` as soon as any strategy confirms null coords so the
 /// caller never retries a valid "no element" response.
 fn parse_coordinate(text: &str) -> ParseResult {
+    // Strategy 0: safe first-{…last-} substring extraction.
+    if let Some(span) = first_to_last_brace(text) {
+        match try_parse_result(span) {
+            ParseResult::ParseFailed => {}
+            other => return other,
+        }
+    }
+
     let stripped = strip_reasoning(text);
     let s = stripped.trim();
 
@@ -886,11 +874,54 @@ fn parse_coordinate(text: &str) -> ParseResult {
         }
     }
 
+    // Strategy 5: tolerant regex extraction for truncated / malformed JSON.
+    // Handles responses like: {"x": 1200, "y": 60, "label": "
+    if let Some((x, y)) = extract_coords(s) {
+        info!("ComputerUse: regex extraction found coord ({x:.0}, {y:.0})");
+        return ParseResult::Found(x, y);
+    }
+
     warn!(
         "ComputerUse: all parse strategies failed — text: {}",
         &text[..text.len().min(400)]
     );
     ParseResult::ParseFailed
+}
+
+/// Tolerant coordinate extraction via simple pattern matching.
+///
+/// Does NOT rely on full JSON parsing — works on truncated responses where
+/// the closing brace and/or label field are missing.
+/// Looks for `"x"` and `"y"` keys followed by a numeric value anywhere in
+/// the text, using a minimal hand-rolled scan instead of the `regex` crate.
+fn extract_coords(text: &str) -> Option<(f64, f64)> {
+    fn find_number_after_key(text: &str, key: &str) -> Option<f64> {
+        // Find the key string, then scan forward for a number.
+        let key_pos = text.find(key)?;
+        let after_key = &text[key_pos + key.len()..];
+        // Skip whitespace, colon, more whitespace.
+        let after_sep = after_key
+            .trim_start_matches(|c: char| c == ':' || c == ' ' || c == '\t');
+        // "null" means no element.
+        if after_sep.starts_with("null") {
+            return None;
+        }
+        // Collect the numeric token (digits, optional leading minus, optional dot).
+        let num_end = after_sep.find(|c: char| !c.is_ascii_digit() && c != '-' && c != '.').unwrap_or(after_sep.len());
+        let num_str = &after_sep[..num_end];
+        num_str.parse::<f64>().ok().filter(|v| v.is_finite())
+    }
+
+    // Try both `"x"` and `"x":` patterns to be safe.
+    let x = find_number_after_key(text, "\"x\":")?;
+    let y = find_number_after_key(text, "\"y\":")?;
+
+    // Reject if both are exactly zero — likely a parsing artifact, not a real coord.
+    if x == 0.0 && y == 0.0 {
+        return None;
+    }
+
+    Some((x, y))
 }
 
 fn try_parse_result(s: &str) -> ParseResult {
@@ -946,6 +977,20 @@ fn last_brace_span(text: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Extracts the substring from the first `{` to the last `}` in the text.
+///
+/// This is the simplest safe extraction strategy — works when the model emits
+/// prose before or after the JSON object.
+fn first_to_last_brace(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end >= start {
+        Some(&text[start..=end])
+    } else {
+        None
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -1100,6 +1145,22 @@ mod tests {
             parse_coordinate(r#"{"x":null,"y":null,"label":"none"}"#),
             ParseResult::NoElement
         ));
+    }
+    #[test]
+    fn truncated_json_regex_fallback() {
+        // Simulates a model response truncated before the closing brace.
+        let truncated = r#"{"x": 1200, "y": 60, "label": ""#;
+        assert_eq!(parse_opt(truncated), Some((1200.0, 60.0)));
+    }
+    #[test]
+    fn truncated_json_no_label_key_value() {
+        // Exactly what Gemini returned in the failing run: ends after "label with no value.
+        let truncated = r#"{"x": 1000, "y": 678, "label"#;
+        assert_eq!(parse_opt(truncated), Some((1000.0, 678.0)));
+    }
+    #[test]
+    fn extract_coords_null_returns_none() {
+        assert!(extract_coords(r#"{"x": null, "y": null}"#).is_none());
     }
 
     // ── Denormalisation ────────────────────────────────────────────────────

@@ -1,11 +1,12 @@
-/// LLM pipeline handler — vision + Computer Use + TTS.
+/// LLM pipeline handler — vision + TTS.
 ///
 /// Screenshots arrive from the frontend over WebSocket. The backend no longer captures them.
-use crate::api::{self, computer_use, gemini, openrouter, Provider};
-use crate::core::{coordinate_mapper, point_parser};
+/// Computer Use is no longer run in the primary pipeline — the frontend requests it on-demand
+/// via `ClientMessage::RequestCUCoordinate` when the local UI-map match score is too low.
+use crate::api::{self, gemini, openrouter, Provider};
 use crate::error::AppError;
 use crate::handlers::tts;
-use clicky_types::{DisplayInfo, ScreenshotData, ServerMessage};
+use clicky_types::{DisplayInfo, ElementIntent, ScreenshotData, ServerMessage};
 use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
@@ -13,7 +14,6 @@ use tracing::{error, info, warn};
 
 pub struct LlmPipelineConfig {
     pub llm_provider: Arc<api::Provider>,
-    pub cu_provider: Arc<api::Provider>,
     pub deepgram_api_key: Option<String>,
     pub deepgram_tts_voice: Option<String>,
     pub tts_enabled: bool,
@@ -21,11 +21,12 @@ pub struct LlmPipelineConfig {
     pub llm_rate_limiter: Arc<Semaphore>,
 }
 
-/// Runs the full LLM pipeline for a completed transcript.
+/// Runs the LLM + TTS pipeline for a completed transcript.
 ///
-/// LLM and Computer Use fire simultaneously via `tokio::join!`.
-/// TTS fires as soon as LLM text is known (overlapping whatever CU time remains).
-/// A single `ServerMessage::PipelineReady` is emitted when all three are done.
+/// LLM call fires first; TTS fires as soon as LLM text is known.
+/// Computer Use is NOT called here — the frontend requests it on-demand via
+/// `ClientMessage::RequestCUCoordinate` when the UI-map confidence gate fails.
+/// A single `ServerMessage::PipelineReady` is emitted when LLM + TTS are done.
 pub async fn run_llm_pipeline(
     http_client: reqwest::Client,
     config: LlmPipelineConfig,
@@ -46,6 +47,12 @@ pub async fn run_llm_pipeline(
         return;
     }
 
+    info!(
+        "[LLM] pipeline start — transcript='{}' screenshots={} displays={}",
+        transcript,
+        screenshots.len(),
+        display_infos.len()
+    );
     log_debug_screenshots(&screenshots, &display_infos);
 
     let mut messages: Vec<serde_json::Value> = Vec::new();
@@ -64,93 +71,75 @@ pub async fn run_llm_pipeline(
     };
     messages.push(serde_json::json!({"role": "user", "content": user_content}));
 
-    // ── Fire LLM and Computer Use simultaneously ─────────────────────────────
-    let llm_future = run_llm_call(&http_client, &config, messages);
-    let cu_future = detect_computer_use_coordinate(
-        &http_client,
-        &screenshots,
-        &display_infos,
-        Arc::clone(&config.cu_provider),
-        &transcript,
-        Arc::clone(&config.llm_rate_limiter),
-    );
-
-    let (llm_result, cu_result) = tokio::join!(llm_future, cu_future);
+    let llm_result = run_llm_call(&http_client, &config, messages).await;
 
     let response_text = match llm_result {
         Ok(text) => text,
         Err(err) => {
-            error!("LLM API error: {err}");
+            error!("[LLM] API error: {err}");
             let _ = server_tx.send(err.into_server_message()).await;
             return;
         }
     };
 
     if response_text.is_empty() {
-        warn!("LLM returned empty response, aborting pipeline");
+        warn!("[LLM] empty response — aborting pipeline");
         let _ = server_tx
             .send(AppError::Llm("empty response from model".into()).into_server_message())
             .await;
         return;
     }
 
-    append_to_log(&format!("[LLM] transcript: {transcript}\n[LLM] response: {response_text}\n"));
+    info!("[LLM] response received ({} chars)", response_text.len());
 
-    let parsed = point_parser::parse_claude_response(&response_text);
+    let intent = parse_intent_json(&response_text);
+    info!("[LLM] parsed intent: {:?}", intent.as_ref().map(|i| (&i.label, &i.region_hint)));
 
-    // POINT-tag fallback coordinate — used when CU found nothing.
-    let point_tag_coordinate =
-        parsed.pointing.as_ref().and_then(|pointing| {
-            coordinate_mapper::find_target_display(pointing.screen_number, &display_infos).map(
-                |display| {
-                    let global = coordinate_mapper::map_screenshot_pixels_to_global(
-                        pointing.screenshot_pixel_x,
-                        pointing.screenshot_pixel_y,
-                        display,
-                    );
-                    (global.x, global.y)
-                },
-            )
-        });
+    // Strip the JSON block from the spoken text so TTS doesn't read raw JSON.
+    let spoken_text = strip_intent_json(&response_text);
+    info!("[LLM] spoken_text ({} chars): '{}'", spoken_text.len(), &spoken_text[..spoken_text.len().min(100)]);
 
-    // ── TTS fires after LLM text is known; CU is typically still running in
-    // join! above and is already done by this point (CU wall-clock > LLM).
-    // If CU finishes first, this await is effectively free.
-    let mp3_bytes = if config.tts_enabled && !parsed.spoken_text.is_empty() {
+    append_to_log(&format!(
+        "[LLM] transcript: {transcript}\n[LLM] response: {response_text}\n[LLM] intent: {intent:?}\n"
+    ));
+
+    let mp3_bytes = if config.tts_enabled && !spoken_text.is_empty() {
+        info!("[TTS] synthesis starting ({} chars)", spoken_text.len());
         if let Some(ref api_key) = config.deepgram_api_key {
-            tts::synthesize_speech_bytes(
+            let bytes = tts::synthesize_speech_bytes(
                 &http_client,
                 api_key,
                 config.deepgram_tts_voice.as_deref(),
-                &parsed.spoken_text,
+                &spoken_text,
             )
-            .await
+            .await;
+            info!("[TTS] synthesis done — {} bytes", bytes.len());
+            bytes
         } else {
             Vec::new()
         }
     } else {
+        if !config.tts_enabled {
+            info!("[TTS] disabled");
+        }
         Vec::new()
     };
 
-    let coordinate = cu_result.or(point_tag_coordinate);
-    if let Some((x, y)) = coordinate {
-        append_to_log(&format!("[CU] coordinate: ({x:.1}, {y:.1})\n"));
-    }
-
-    // When the LLM returned nothing useful (empty spoken text) and no coordinate
-    // was found either, give the user audible feedback instead of silent Idle.
-    let final_spoken = if parsed.spoken_text.is_empty() {
+    let final_spoken = if spoken_text.is_empty() {
         "I didn't quite get you".to_owned()
     } else {
-        parsed.spoken_text.clone()
+        spoken_text
     };
 
+    info!("[PIPELINE] sending PipelineReady — intent={:?}", intent.as_ref().map(|i| &i.label));
     let _ = server_tx
         .send(ServerMessage::PipelineReady {
             spoken_text: final_spoken,
             mp3_bytes,
-            coordinate,
+            // coordinate is always None — the frontend resolves position via UI-map / CU
+            coordinate: None,
             display_infos,
+            intent,
         })
         .await;
 }
@@ -167,7 +156,7 @@ async fn run_llm_call(
                 http_client,
                 api_key,
                 model,
-                openrouter::COMPANION_VOICE_RESPONSE_SYSTEM_PROMPT,
+                INTENT_SYSTEM_PROMPT,
                 messages,
                 Arc::clone(&config.llm_rate_limiter),
             )
@@ -179,7 +168,7 @@ async fn run_llm_call(
                 http_client,
                 api_key,
                 model,
-                openrouter::COMPANION_VOICE_RESPONSE_SYSTEM_PROMPT,
+                INTENT_SYSTEM_PROMPT,
                 messages,
                 Arc::clone(&config.llm_rate_limiter),
             )
@@ -188,38 +177,88 @@ async fn run_llm_call(
     }
 }
 
-async fn detect_computer_use_coordinate(
-    http_client: &reqwest::Client,
-    screenshots: &[ScreenshotData],
-    display_infos: &[DisplayInfo],
-    cu_provider: Arc<Provider>,
-    transcript: &str,
-    rate_limiter: Arc<Semaphore>,
-) -> Option<(f64, f64)> {
-    let cursor_display = display_infos.iter().find(|d| d.is_cursor_display)?;
-    let cursor_screenshot = screenshots
-        .iter()
-        .zip(display_infos.iter())
-        .find(|(_, d)| d.is_cursor_display)
-        .map(|(s, _)| s)?;
+/// System prompt that instructs the LLM to emit structured intent JSON instead of POINT tags.
+///
+/// The LLM must NEVER guess coordinates — all position data is resolved by the frontend.
+const INTENT_SYSTEM_PROMPT: &str = r#"you're clicky, a friendly always-on companion that lives in the user's system tray. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
 
-    info!("running Computer Use for precise coordinate detection");
+rules:
+- default to one or two sentences. be direct and dense. BUT if the user asks you to explain more, go deeper, or elaborate, then go all out — give a thorough, detailed explanation with no length limit.
+- all lowercase, casual, warm. no emojis.
+- write for the ear, not the eye. short sentences. no lists, bullet points, markdown, or formatting — just natural speech.
+- don't use abbreviations or symbols that sound weird read aloud. write "for example" not "e.g.", spell out small numbers.
+- if the user's question relates to what's on their screen, reference specific things you see.
+- if the screenshot doesn't seem relevant to their question, just answer the question directly.
+- you can help with anything — coding, writing, general knowledge, brainstorming.
+- never say "simply" or "just".
+- don't read out code verbatim. describe what the code does or what needs to change conversationally.
+- focus on giving a thorough, useful explanation.
+- if you receive multiple screen images, the one labeled "primary focus" is where the cursor is — prioritize that one but reference others if relevant.
 
-    let coordinate = computer_use::detect_element_location(
-        http_client,
-        cu_provider,
-        &cursor_screenshot.jpeg_data,
-        transcript,
-        cursor_display.display_width_points,
-        cursor_display.display_height_points,
-        rate_limiter,
-    )
-    .await?;
+element pointing:
+you have a small blue triangle cursor that can fly to and point at things on screen. use it whenever pointing would genuinely help the user — if they're asking how to do something, looking for a menu, trying to find a button, or need help navigating an app, point at the relevant element. err on the side of pointing rather than not pointing.
 
-    let global_x = cursor_display.global_origin_x + coordinate.display_local_x;
-    let global_y = cursor_display.global_origin_y + coordinate.display_local_y;
-    info!("Computer Use global coordinate: ({global_x:.1}, {global_y:.1})");
-    Some((global_x, global_y))
+IMPORTANT: you must NEVER guess or output pixel coordinates. instead, when pointing would help, append a JSON block at the very end of your response (after your spoken text), on its own line:
+
+{"label":"<short element description>","action":"click","region_hint":"<top right|center|bottom left|etc>","screen_number":<N or null>}
+
+the label must be a short human-readable description of the UI element (e.g. "Submit button", "Search field", "Settings menu").
+action must be one of: "click", "focus", "hover".
+region_hint is a rough screen region like "top right", "center", "bottom left", "top left", "top center", "bottom right".
+screen_number is the 1-based screen index if the element is on a non-primary screen, otherwise null.
+
+if pointing would NOT help, do not append any JSON block.
+
+examples:
+- user asks how to color grade in final cut: "you'll want to open the color inspector — it's right up in the top right area of the toolbar."
+  {"label":"Color Inspector button","action":"click","region_hint":"top right","screen_number":null}
+- user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page."
+- user asks how to commit in xcode: "see that source control menu up top? click that and hit commit."
+  {"label":"Source Control menu","action":"click","region_hint":"top left","screen_number":null}"#;
+
+/// Parses a structured intent JSON block from the end of an LLM response.
+///
+/// Looks for the last `{...}` block containing at least a "label" key.
+/// Returns `None` if no valid intent block is found.
+fn parse_intent_json(text: &str) -> Option<ElementIntent> {
+    // Find the last JSON object in the text — the intent block is always at the end.
+    let last_brace = text.rfind('{')?;
+    let after = &text[last_brace..];
+    let end = after.find('}')? + 1;
+    let json_slice = &after[..end];
+
+    let value: serde_json::Value = serde_json::from_str(json_slice).ok()?;
+    let label = value.get("label")?.as_str()?.to_string();
+    if label.is_empty() {
+        return None;
+    }
+    let action = value
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("click")
+        .to_string();
+    let region_hint = value
+        .get("region_hint")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let screen_number = value
+        .get("screen_number")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+
+    Some(ElementIntent { label, action, region_hint, screen_number })
+}
+
+/// Removes the trailing intent JSON block from the LLM response so TTS doesn't read raw JSON.
+fn strip_intent_json(text: &str) -> String {
+    if let Some(last_brace) = text.rfind('{') {
+        let after = &text[last_brace..];
+        if after.contains('}') && after.contains("\"label\"") {
+            return text[..last_brace].trim_end().to_string();
+        }
+    }
+    text.trim().to_string()
 }
 
 #[cfg(debug_assertions)]

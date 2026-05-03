@@ -11,6 +11,7 @@ mod panel;
 mod platform;
 mod screenshot;
 mod tray;
+mod ui_map;
 
 use api::adapter::{ApiAdapter, BACKEND_PORT};
 use app::state_machine::VoiceState;
@@ -124,6 +125,9 @@ fn main() {
     let font_system = overlay::font::create_font_system();
     let render_state = OverlayRenderState::new();
 
+    let (screenshot_local_tx, screenshot_local_rx) =
+        std::sync::mpsc::sync_channel::<(Vec<clicky_types::ScreenshotData>, Vec<clicky_types::DisplayInfo>)>(4);
+
     let mut app = OverlayApp {
         platform,
         app_config,
@@ -166,6 +170,12 @@ fn main() {
         last_sent_cursor_pos: (0.0, 0.0),
         mouse_pos_at_release: (0.0, 0.0),
         mouse_velocity: (0.0, 0.0),
+        last_screenshots: None,
+        last_display_infos: None,
+        last_ui_map: None,
+        pending_intent: None,
+        screenshot_local_tx,
+        screenshot_local_rx,
         diag_last_log_at: Instant::now(),
         diag_frame_intervals_ms: Vec::with_capacity(600),
         diag_flush_ms: Vec::with_capacity(600),

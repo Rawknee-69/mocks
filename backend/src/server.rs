@@ -22,6 +22,10 @@ use tokio_tungstenite::{
 };
 use tracing::{error, info, warn};
 
+/// How often the server sends a WebSocket Ping frame to keep TCP alive and
+/// detect dead connections before the OS's 10054 / ECONNRESET fires silently.
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// RPM cap. One permit is consumed per LLM or Computer Use request.
 const RPM_CAP: usize = 20;
 /// Deepgram concurrent TTS streams cap.
@@ -32,6 +36,10 @@ pub async fn run(port: u16) {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("invalid address");
     let listener = TcpListener::bind(addr).await.expect("failed to bind port");
     info!("WebSocket server listening on ws://{addr}");
+
+    // One shared HTTP client for the entire server lifetime — connection-pool reuse.
+    // Creating a new Client per connection wastes sockets and disables keep-alive pooling.
+    let http_client: Arc<reqwest::Client> = Arc::new(reqwest::Client::new());
 
     // Build providers once at startup — env vars are read a single time here.
     let ai_provider_str = std::env::var("AI_PROVIDER").unwrap_or_else(|_| "openrouter".into());
@@ -80,6 +88,7 @@ pub async fn run(port: u16) {
                     Arc::clone(&tts_rate_limiter),
                     Arc::clone(&llm_provider),
                     Arc::clone(&cu_provider),
+                    Arc::clone(&http_client),
                 ));
             }
             Err(err) => {
@@ -120,6 +129,7 @@ async fn handle_connection(
     _tts_rate_limiter: Arc<Semaphore>,
     llm_provider: Arc<api::Provider>,
     cu_provider: Arc<api::Provider>,
+    http_client: Arc<reqwest::Client>,
 ) {
     let ws_config = WebSocketConfig::default()
         .max_message_size(Some(32 * 1024 * 1024))
@@ -143,14 +153,13 @@ async fn handle_connection(
     let deepgram_tts_voice = std::env::var("DEEPGRAM_TTS_VOICE").ok();
     let tts_enabled = deepgram_key.is_some();
 
-    let http_client = reqwest::Client::new();
-
     let mut active_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
     let mut audio_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>> = None;
     let mut conversation_history: VecDeque<(String, String)> = VecDeque::new();
     let mut last_transcript: Option<String> = None;
     let mut cursor_position: (f32, f32) = (0.0, 0.0);
-    let mut pending_screenshots: Option<(Vec<ScreenshotData>, Vec<DisplayInfo>)> = None;
+    // Screenshots are retained across turns so RequestCUCoordinate can use them later.
+    let mut last_screenshots: Option<(Vec<ScreenshotData>, Vec<DisplayInfo>)> = None;
 
     // Internal channel: pipeline tasks send ServerMessages here; this loop also
     // intercepts FinalTranscript to trigger the LLM pipeline.
@@ -167,6 +176,21 @@ async fn handle_connection(
         }
     });
 
+    // Keepalive ticker — sends a WebSocket Ping every KEEPALIVE_INTERVAL so the OS
+    // TCP stack detects dead connections promptly instead of silently sitting on them
+    // until the kernel fires ECONNRESET / 10054.
+    let server_tx_ping = server_tx.clone();
+    let keepalive_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(KEEPALIVE_INTERVAL);
+        interval.tick().await; // skip the immediate first tick
+        loop {
+            interval.tick().await;
+            if server_tx_ping.send(ServerMessage::Ping).await.is_err() {
+                break;
+            }
+        }
+    });
+
     // Main receive loop
     loop {
         tokio::select! {
@@ -174,6 +198,7 @@ async fn handle_connection(
             ws_msg = ws_source.next() => {
                 let raw_message = match ws_msg {
                     Some(Ok(Message::Text(text))) => text.to_string(),
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => continue,
                     Some(Err(err)) => {
@@ -195,11 +220,13 @@ async fn handle_connection(
                     &mut active_cancel,
                     &mut audio_tx,
                     &mut cursor_position,
-                    &mut pending_screenshots,
+                    &mut last_screenshots,
                     &deepgram_key,
                     &http_client,
                     pipeline_tx.clone(),
                     &server_tx,
+                    Arc::clone(&cu_provider),
+                    Arc::clone(&llm_rate_limiter),
                 ).await;
             }
 
@@ -232,32 +259,48 @@ async fn handle_connection(
                             )
                             .await;
                     } else {
-                        // Compact history before passing it to the pipeline
-                        context_compactor::maybe_compact(
-                            &mut conversation_history,
-                            &http_client,
-                            &llm_provider,
-                            Arc::clone(&llm_rate_limiter),
-                        )
-                        .await;
+                        info!("final transcript: '{}' — launching LLM pipeline", transcript);
 
+                        // context_compactor can make HTTP calls; run it in a spawned task
+                        // so it never blocks the select loop from processing new WS messages
+                        // or pipeline events while the compactor awaits a network response.
                         let config = llm_pipeline::LlmPipelineConfig {
                             llm_provider: Arc::clone(&llm_provider),
-                            cu_provider: Arc::clone(&cu_provider),
                             deepgram_api_key: deepgram_key.clone(),
                             deepgram_tts_voice: deepgram_tts_voice.clone(),
                             tts_enabled,
                             llm_rate_limiter: Arc::clone(&llm_rate_limiter),
                         };
-                        let client = http_client.clone();
+                        let client = Arc::clone(&http_client);
                         let tx = pipeline_tx.clone();
                         let history: Vec<(String, String)> =
                             conversation_history.iter().cloned().collect();
                         let (screenshots, display_infos) =
-                            pending_screenshots.take().unwrap_or_default();
-                        tokio::spawn(llm_pipeline::run_llm_pipeline(
-                            client, config, transcript, screenshots, display_infos, history, tx,
-                        ));
+                            last_screenshots.clone().unwrap_or_default();
+                        let compact_provider = Arc::clone(&llm_provider);
+                        let compact_rl = Arc::clone(&llm_rate_limiter);
+                        tokio::spawn(async move {
+                            // Compactor runs inside the spawned task — never blocks the loop.
+                            let mut history_mut = history.iter().cloned().collect::<VecDeque<_>>();
+                            context_compactor::maybe_compact(
+                                &mut history_mut,
+                                &client,
+                                &compact_provider,
+                                compact_rl,
+                            )
+                            .await;
+                            let compacted: Vec<(String, String)> = history_mut.into_iter().collect();
+                            llm_pipeline::run_llm_pipeline(
+                                (*client).clone(),
+                                config,
+                                transcript,
+                                screenshots,
+                                display_infos,
+                                compacted,
+                                tx,
+                            )
+                            .await;
+                        });
                     }
                 }
 
@@ -273,7 +316,13 @@ async fn handle_connection(
                     }
                 }
 
-                // Forward everything to the WebSocket
+                // Ping frames are an internal keepalive signal, not a user message.
+                if let ServerMessage::Ping = message {
+                    let _ = relay_tx.send(message).await;
+                    continue;
+                }
+
+                // Forward everything else to the WebSocket
                 let _ = relay_tx.send(message).await;
             }
         }
@@ -282,6 +331,7 @@ async fn handle_connection(
     info!("WebSocket connection closed");
     forwarder_handle.abort();
     relay_handle.abort();
+    keepalive_handle.abort();
 }
 
 /// Routes a single `ClientMessage` from the frontend to the appropriate pipeline.
@@ -290,15 +340,17 @@ async fn handle_client_message(
     active_cancel: &mut Option<tokio::sync::oneshot::Sender<()>>,
     audio_tx: &mut Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     cursor_position: &mut (f32, f32),
-    pending_screenshots: &mut Option<(Vec<ScreenshotData>, Vec<DisplayInfo>)>,
+    last_screenshots: &mut Option<(Vec<ScreenshotData>, Vec<DisplayInfo>)>,
     deepgram_key: &Option<String>,
-    http_client: &reqwest::Client,
+    http_client: &Arc<reqwest::Client>,
     pipeline_tx: mpsc::Sender<ServerMessage>,
     server_tx: &mpsc::Sender<ServerMessage>,
+    cu_provider: Arc<api::Provider>,
+    llm_rate_limiter: Arc<Semaphore>,
 ) {
     match message {
         ClientMessage::HotkeyPressed => {
-            info!("hotkey pressed");
+            info!("[HOTKEY] pressed — starting STT session");
 
             if let Some(cancel) = active_cancel.take() {
                 let _ = cancel.send(());
@@ -324,7 +376,7 @@ async fn handle_client_message(
             tokio::spawn(transcription::run_transcription_bridge(
                 audio_std_rx,
                 pipeline_tx,
-                http_client.clone(),
+                (**http_client).clone(),
                 api_key,
                 cancel_rx,
             ));
@@ -337,7 +389,7 @@ async fn handle_client_message(
         }
 
         ClientMessage::HotkeyReleased => {
-            info!("hotkey released — waiting for final transcript");
+            info!("[HOTKEY] released — draining audio, waiting for final transcript");
             *audio_tx = None;
             if let Some(cancel) = active_cancel.take() {
                 let _ = cancel.send(());
@@ -345,7 +397,7 @@ async fn handle_client_message(
         }
 
         ClientMessage::CancelPipeline => {
-            info!("pipeline cancelled by frontend");
+            info!("[PIPELINE] cancelled by frontend");
             if let Some(cancel) = active_cancel.take() {
                 let _ = cancel.send(());
             }
@@ -357,13 +409,96 @@ async fn handle_client_message(
         }
 
         ClientMessage::Screenshots { screenshots, display_infos } => {
-            info!("received {} screenshots from frontend", screenshots.len());
-            *pending_screenshots = Some((screenshots, display_infos));
+            info!(
+                "[SCREENSHOTS] received {} screenshots from frontend (displays: {})",
+                screenshots.len(),
+                display_infos.len()
+            );
+            for (i, d) in display_infos.iter().enumerate() {
+                info!(
+                    "  display[{i}]: origin=({:.0},{:.0}) logical={:.0}x{:.0} ss={}x{} cursor={}",
+                    d.global_origin_x, d.global_origin_y,
+                    d.display_width_points, d.display_height_points,
+                    d.screenshot_width_pixels, d.screenshot_height_pixels,
+                    d.is_cursor_display,
+                );
+            }
+            *last_screenshots = Some((screenshots, display_infos));
+        }
+
+        ClientMessage::RequestCUCoordinate { intent, screenshot_index } => {
+            info!("[CU] RequestCUCoordinate — label='{}' display_index={}", intent.label, screenshot_index);
+
+            let Some((ref screenshots, ref display_infos)) = *last_screenshots else {
+                warn!("[CU] no screenshots available, sending None");
+                let _ = server_tx.send(ServerMessage::CUCoordinate { coordinate: None }).await;
+                return;
+            };
+
+            let Some(display_info) = display_infos.get(screenshot_index) else {
+                warn!("[CU] screenshot_index {screenshot_index} out of range");
+                let _ = server_tx.send(ServerMessage::CUCoordinate { coordinate: None }).await;
+                return;
+            };
+
+            let Some(screenshot) = screenshots.get(screenshot_index) else {
+                warn!("[CU] screenshot_index {screenshot_index} out of range");
+                let _ = server_tx.send(ServerMessage::CUCoordinate { coordinate: None }).await;
+                return;
+            };
+
+            let jpeg_data = screenshot.jpeg_data.clone();
+            let display_w = display_info.display_width_points;
+            let display_h = display_info.display_height_points;
+            let origin_x = display_info.global_origin_x;
+            let origin_y = display_info.global_origin_y;
+            let label = intent.label.clone();
+
+            info!("[CU] launching detection: '{}' on {:.0}x{:.0} display at ({:.0},{:.0})",
+                label, display_w, display_h, origin_x, origin_y);
+
+            let http = Arc::clone(http_client);
+            let server_tx_clone = server_tx.clone();
+            tokio::spawn(async move {
+                info!("[CU] detection started for '{label}'");
+                let result = computer_use::detect_element_location(
+                    &http,
+                    cu_provider,
+                    &jpeg_data,
+                    &label,
+                    display_w,
+                    display_h,
+                    llm_rate_limiter,
+                )
+                .await;
+
+                let coordinate = result.map(|coord| {
+                    let gx = origin_x + coord.display_local_x;
+                    let gy = origin_y + coord.display_local_y;
+                    info!("[CU] detection result: local=({:.1},{:.1}) global=({gx:.1},{gy:.1})",
+                        coord.display_local_x, coord.display_local_y);
+                    (gx, gy)
+                });
+
+                if coordinate.is_none() {
+                    warn!("[CU] detection returned no element for '{label}'");
+                }
+
+                info!("[CU] sending CUCoordinate to frontend: {:?}", coordinate);
+                let send_result = server_tx_clone
+                    .send(ServerMessage::CUCoordinate { coordinate })
+                    .await;
+                if send_result.is_err() {
+                    warn!("[CU] failed to send CUCoordinate — frontend channel closed");
+                }
+            });
         }
     }
 }
 
 /// Serialises `ServerMessage` values to JSON and writes them to the WebSocket sink.
+///
+/// `ServerMessage::Ping` is converted to a WebSocket Ping frame (no JSON encoding).
 async fn forward_to_websocket(
     mut server_rx: mpsc::Receiver<ServerMessage>,
     mut ws_sink: futures_util::stream::SplitSink<
@@ -372,6 +507,14 @@ async fn forward_to_websocket(
     >,
 ) {
     while let Some(message) = server_rx.recv().await {
+        // Ping is a transport keepalive — send as a native WS Ping, not JSON.
+        if let ServerMessage::Ping = message {
+            if ws_sink.send(Message::Ping(vec![].into())).await.is_err() {
+                break;
+            }
+            continue;
+        }
+
         let json = match serde_json::to_string(&message) {
             Ok(j) => j,
             Err(err) => {

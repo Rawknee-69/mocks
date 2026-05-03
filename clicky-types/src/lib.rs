@@ -32,6 +32,30 @@ pub enum ClientMessage {
         screenshots: Vec<ScreenshotData>,
         display_infos: Vec<DisplayInfo>,
     },
+
+    /// Frontend requests an on-demand Computer Use coordinate detection for a specific intent.
+    /// Triggered when the local UI-map match score falls below the confidence threshold.
+    RequestCUCoordinate {
+        intent: ElementIntent,
+        /// Index into the screenshots array (from the last Screenshots message) to use for CU.
+        screenshot_index: usize,
+    },
+}
+
+/// Structured intent emitted by the LLM — describes WHAT to interact with, not WHERE.
+///
+/// The frontend uses this to drive UI-map matching and, on fallback, Computer Use.
+/// The LLM must never emit coordinates; all position data comes from the UI pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElementIntent {
+    /// Human-readable element description, e.g. "Submit button", "Search field".
+    pub label: String,
+    /// Interaction type: "click", "focus", "hover".
+    pub action: String,
+    /// Coarse screen region hint, e.g. "top right", "center", "bottom left".
+    pub region_hint: Option<String>,
+    /// Which screen number (1-based) the element lives on; None = cursor's screen.
+    pub screen_number: Option<u32>,
 }
 
 /// A captured screenshot to send to the backend for LLM processing.
@@ -56,8 +80,9 @@ pub enum ServerMessage {
     /// Incremental LLM text chunk from SSE streaming.
     LlmTextDelta { chunk: String },
 
-    /// All pipeline results delivered atomically once LLM + CU + TTS all finish.
-    /// Replaces the old LlmResponse + ComputerUseCoordinate + TtsAudio triple.
+    /// All pipeline results delivered atomically once LLM + TTS finish.
+    /// The `coordinate` field is always `None` — the frontend now drives coordinate
+    /// resolution via UI-map matching and on-demand CU fallback.
     PipelineReady {
         /// Text that was spoken aloud (also used for the speech bubble).
         spoken_text: String,
@@ -65,11 +90,22 @@ pub enum ServerMessage {
         /// Raw MP3 bytes from Deepgram TTS.  Empty Vec if TTS was disabled or failed.
         mp3_bytes: Vec<u8>,
 
-        /// Cursor target: CU result if found, POINT-tag fallback otherwise, or None.
+        /// Always `None` — coordinate resolution moved to the frontend.
         coordinate: Option<(f64, f64)>,
 
         /// Metadata for every captured display (used for coordinate mapping).
         display_infos: Vec<DisplayInfo>,
+
+        /// Structured element intent from the LLM.  `None` if the user's request
+        /// didn't reference any specific UI element.
+        intent: Option<ElementIntent>,
+    },
+
+    /// Response to `ClientMessage::RequestCUCoordinate`.
+    /// The coordinate is in global display space (logical pixels).  `None` means
+    /// Computer Use found no matching element.
+    CUCoordinate {
+        coordinate: Option<(f64, f64)>,
     },
 
     /// A pipeline stage failed. The frontend should return to Idle state.
@@ -77,6 +113,12 @@ pub enum ServerMessage {
         code: ErrorCode,
         message: String,
     },
+
+    /// Internal keepalive heartbeat — converted to a WebSocket Ping frame, never
+    /// forwarded to the frontend as JSON.  Helps detect stale TCP connections before
+    /// the OS fires ECONNRESET / error 10054.
+    #[serde(skip)]
+    Ping,
 }
 
 // ─── Shared data types ────────────────────────────────────────────────────────

@@ -24,9 +24,9 @@ const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/
 
 /// Sends a request to Gemini and returns the full response text.
 ///
-/// `messages` follow the same shape as the OpenRouter pipeline produces:
-/// `[{"role":"user","content": <parts Value>}, ...]`.
-/// This function translates them into the Gemini `contents` wire format.
+/// Only the current turn is sent — no conversation history — to prevent context
+/// pollution from previous transcript/screenshot pairs contaminating responses.
+/// `messages` must contain exactly one entry: the current user turn.
 pub async fn stream_llm_response(
     http_client: &Client,
     api_key: &str,
@@ -37,7 +37,14 @@ pub async fn stream_llm_response(
 ) -> Result<String, AppError> {
     let url = format!("{GEMINI_API_BASE}/{model}:generateContent?key={api_key}");
 
-    let contents = convert_messages_to_gemini_contents(messages);
+    // Always take only the last (most recent) user message regardless of how many
+    // messages the pipeline passes in — this is the single-turn, no-history contract.
+    let current_message = messages
+        .into_iter()
+        .last()
+        .ok_or_else(|| AppError::Llm("no messages provided".into()))?;
+
+    let contents = convert_messages_to_gemini_contents(vec![current_message]);
 
     let request_body = json!({
         "systemInstruction": {
@@ -48,6 +55,7 @@ pub async fn stream_llm_response(
     });
 
     // Log the outgoing request (omit base64 image data to keep logs readable).
+    // contents_count must always be 1.
     info!(
         "Gemini request → model={model} contents_count={} system_prompt_len={}",
         request_body["contents"].as_array().map(|a| a.len()).unwrap_or(0),

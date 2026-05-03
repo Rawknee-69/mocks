@@ -229,13 +229,17 @@ fn server_message_to_ui_event(msg: ServerMessage) -> Option<UiEvent> {
             None
         }
 
-        ServerMessage::PipelineReady { spoken_text, mp3_bytes, coordinate, display_infos } => {
-            Some(UiEvent::PipelineReady {
+        ServerMessage::PipelineReady { spoken_text, mp3_bytes, coordinate: _, display_infos, intent } => {
+            Some(UiEvent::PipelineReadyWithIntent {
                 spoken_text,
                 mp3_bytes,
-                coordinate,
+                intent,
                 display_infos,
             })
+        }
+
+        ServerMessage::CUCoordinate { coordinate } => {
+            Some(UiEvent::CUCoordinateReady { coordinate })
         }
 
         ServerMessage::Error { code, message } => {
@@ -245,5 +249,8 @@ fn server_message_to_ui_event(msg: ServerMessage) -> Option<UiEvent> {
                 _ => Some(UiEvent::PipelineError(message)),
             }
         }
+
+        // Transport-level keepalive — never forwarded as a UiEvent.
+        ServerMessage::Ping => None,
     }
 }
