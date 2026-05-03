@@ -17,7 +17,6 @@ use crate::app::state_machine::{VoiceState, VoiceStateTransition};
 use crate::audio::capture::MicCapture;
 use crate::audio::playback::AudioPlayer;
 use crate::audio::UiEvent;
-use clicky_types::ClientMessage;
 use crate::config::AppConfig;
 use crate::core::audio_rms::AudioPowerLevelTracker;
 use crate::cursor_tracker::CursorTracker;
@@ -25,6 +24,8 @@ use crate::hotkey::PushToTalkTransition;
 use crate::overlay::gpu::Renderer;
 use crate::overlay::renderer::{CursorNavigationMode, OverlayRenderState};
 use crate::tray::TrayMenuEvent;
+use crate::ui_map::{snap_to_nearest_ui_element, UiMap, SNAP_RADIUS_PX};
+use clicky_types::{ClientMessage, DisplayInfo, ElementIntent, ScreenshotData};
 
 /// All app state that the winit event loop drives.
 pub struct OverlayApp {
@@ -71,6 +72,16 @@ pub struct OverlayApp {
     pub mouse_pos_at_release: (f32, f32),
     // Exponentially smoothed mouse velocity (pixels/second) used for prediction.
     pub mouse_velocity: (f32, f32),
+    // Screenshots kept locally for UI-map matching and CU fallback.
+    pub last_screenshots: Option<Vec<ScreenshotData>>,
+    pub last_display_infos: Option<Vec<DisplayInfo>>,
+    // UI map built from the most recent screenshots.
+    pub last_ui_map: Option<UiMap>,
+    // Pending intent waiting for a CUCoordinateReady reply.
+    pub pending_intent: Option<ElementIntent>,
+    // Channel used by the screenshot task to deliver a local copy to the render loop.
+    pub screenshot_local_tx: std::sync::mpsc::SyncSender<(Vec<ScreenshotData>, Vec<DisplayInfo>)>,
+    pub screenshot_local_rx: std::sync::mpsc::Receiver<(Vec<ScreenshotData>, Vec<DisplayInfo>)>,
     // Per-second timing diagnostics
     pub diag_last_log_at: Instant,
     pub diag_frame_intervals_ms: Vec<f32>,
@@ -291,12 +302,65 @@ impl ApplicationHandler for OverlayApp {
             self.handle_ui_event(event);
         }
 
-        // Processing timeout
+        // Drain locally captured screenshots — build UI map on arrival.
+        while let Ok((screenshots, display_infos)) = self.screenshot_local_rx.try_recv() {
+            // Log display metrics so DPI/scaling issues are immediately visible.
+            for (i, d) in display_infos.iter().enumerate() {
+                let scale_x = if d.display_width_points > 0.0 {
+                    d.screenshot_width_pixels as f64 / d.display_width_points
+                } else {
+                    0.0
+                };
+                let scale_y = if d.display_height_points > 0.0 {
+                    d.screenshot_height_pixels as f64 / d.display_height_points
+                } else {
+                    0.0
+                };
+                log::info!(
+                    "[DISPLAY] display[{i}]: origin=({:.0},{:.0}) logical={:.0}x{:.0} \
+                     ss_px={}x{} scale_x={:.3} scale_y={:.3} cursor={}",
+                    d.global_origin_x, d.global_origin_y,
+                    d.display_width_points, d.display_height_points,
+                    d.screenshot_width_pixels, d.screenshot_height_pixels,
+                    scale_x, scale_y,
+                    d.is_cursor_display,
+                );
+            }
+            // Build the UI map from the cursor display's screenshot.
+            let cursor_ss = screenshots
+                .iter()
+                .zip(display_infos.iter())
+                .find(|(_, d)| d.is_cursor_display)
+                .map(|(s, _)| s);
+            if let Some(ss) = cursor_ss {
+                match crate::ui_map::build_ui_map(&ss.jpeg_data) {
+                    Ok(map) => {
+                        log::info!(
+                            "UI map built: {} elements from {}×{} screenshot",
+                            map.elements.len(),
+                            map.screenshot_width,
+                            map.screenshot_height
+                        );
+                        self.last_ui_map = Some(map);
+                    }
+                    Err(e) => log::warn!("UI map build failed: {e}"),
+                }
+            }
+            self.last_screenshots = Some(screenshots);
+            self.last_display_infos = Some(display_infos);
+        }
+
+        // Processing timeout — always 30s regardless of pipeline state.
+        // The previous 3s short-circuit was firing before screenshots arrived, causing
+        // premature Idle resets. Pipeline flag is cleared only on PipelineReady/Error,
+        // so 30s is the correct upper bound for the full LLM round-trip.
         if self.voice_state == VoiceState::Processing {
             let since = self.processing_since.get_or_insert(now);
-            let timeout = if self.claude_pipeline_active { 30 } else { 3 };
-            if now.duration_since(*since).as_secs() >= timeout {
-                log::warn!("Processing timeout � returning to Idle");
+            if now.duration_since(*since).as_secs() >= 30 {
+                log::warn!(
+                    "[TIMEOUT] Processing >30s (pipeline_active={}) — forcing Idle",
+                    self.claude_pipeline_active
+                );
                 self.voice_state = VoiceState::Idle;
                 self.render_state.voice_state = self.voice_state;
                 self.processing_since = None;
@@ -313,14 +377,14 @@ impl ApplicationHandler for OverlayApp {
                 .as_ref()
                 .map_or(true, |p| !p.is_playing());
 
-            // CU-specific safety timeout: if CU never resolves within 30 s, unblock the
-            // state machine so the app does not get stuck waiting forever.
+            // CU-specific safety timeout: 12s — enough for two-pass CU at 45s/request,
+            // but short enough that a dropped WS response doesn't freeze the UI for 30s.
             if self.cu_coordinate_pending {
                 let cu_elapsed = self
                     .cu_pending_since
                     .map_or(0, |t| now.duration_since(t).as_secs());
-                if cu_elapsed >= 30 {
-                    log::warn!("CU safety timeout — clearing cu_coordinate_pending");
+                if cu_elapsed >= 12 {
+                    log::warn!("[CU] safety timeout (12s) — clearing cu_coordinate_pending");
                     self.cu_coordinate_pending = false;
                     self.cu_pending_since = None;
                 }
@@ -552,7 +616,7 @@ impl OverlayApp {
     fn handle_hotkey(&mut self, transition: PushToTalkTransition) {
         match transition {
             PushToTalkTransition::Pressed => {
-                log::info!("Push-to-talk: PRESSED");
+                log::info!("[HOTKEY] PRESSED — current state={:?}", self.voice_state);
                 if let Some(new_state) =
                     self.voice_state.apply(VoiceStateTransition::HotkeyPressed)
                 {
@@ -573,7 +637,7 @@ impl OverlayApp {
 
                     match self.mic_capture.start() {
                         Ok(audio_rx) => {
-                            log::info!("Mic capture started");
+                            log::info!("[HOTKEY] mic capture started — forwarding audio to backend");
                             self.api_adapter.send(ClientMessage::HotkeyPressed);
                             // Abort any still-running audio-forward task from a previous press.
                             if let Some(handle) = self.audio_forward_task.take() {
@@ -599,21 +663,24 @@ impl OverlayApp {
                             self.audio_forward_task = Some(handle);
                         }
                         Err(e) => {
-                            log::error!("Mic capture failed: {}", e);
+                            log::error!("[HOTKEY] mic capture failed: {}", e);
                             if let Some(s) = self.voice_state.apply(VoiceStateTransition::Error) {
                                 self.voice_state = s;
                                 self.render_state.voice_state = self.voice_state;
                             }
                         }
                     }
+                } else {
+                    log::warn!("[HOTKEY] PRESSED ignored — state {:?} doesn't accept HotkeyPressed", self.voice_state);
                 }
             }
 
             PushToTalkTransition::Released => {
-                log::info!("Push-to-talk: RELEASED");
+                log::info!("[HOTKEY] RELEASED — current state={:?}", self.voice_state);
                 self.mic_capture.stop();
                 // Snapshot mouse position so PipelineReady can drift-compensate.
                 self.mouse_pos_at_release = self.cursor_tracker.get_position();
+                log::info!("[HOTKEY] mouse pos at release: ({:.0},{:.0})", self.mouse_pos_at_release.0, self.mouse_pos_at_release.1);
 
                 if self.simulation_mode {
                     if let Some(s) =
@@ -633,20 +700,36 @@ impl OverlayApp {
                     if let Some(handle) = self.screenshot_task.take() {
                         handle.abort();
                     }
+
+                    // Clear stale UI map so we don't snap to elements from a previous scene.
+                    self.last_ui_map = None;
+                    self.last_screenshots = None;
+                    self.last_display_infos = None;
+                    self.pending_intent = None;
+
+                    let local_tx = self.screenshot_local_tx.clone();
                     let handle = self.tokio_rt.spawn_blocking(move || {
+                        log::info!("[SCREENSHOT] capturing all screens at cursor ({:.0},{:.0})", cursor_pos.0, cursor_pos.1);
                         match crate::screenshot::capture_all_screens(
                             cursor_pos.0,
                             cursor_pos.1,
                             &platform_clone,
                         ) {
                             Ok(capture) => {
+                                log::info!(
+                                    "[SCREENSHOT] captured {} screens — sending to backend and local",
+                                    capture.screenshots.len()
+                                );
+                                // Send to backend
                                 let _ = adapter_tx.try_send(ClientMessage::Screenshots {
-                                    screenshots: capture.screenshots,
-                                    display_infos: capture.display_infos,
+                                    screenshots: capture.screenshots.clone(),
+                                    display_infos: capture.display_infos.clone(),
                                 });
+                                // Also deliver locally for UI-map matching
+                                let _ = local_tx.try_send((capture.screenshots, capture.display_infos));
                             }
                             Err(e) => {
-                                log::error!("Screenshot capture failed: {}", e);
+                                log::error!("[SCREENSHOT] capture failed: {}", e);
                             }
                         }
                     });
@@ -694,19 +777,17 @@ impl OverlayApp {
                 self.processing_since = None;
             }
             UiEvent::PipelineReady { spoken_text, mp3_bytes, coordinate, display_infos } => {
+                // Legacy path — no intent, treat like PipelineReadyWithIntent with intent: None
                 if self.voice_state != VoiceState::Processing {
                     return;
                 }
-                log::info!("PipelineReady: {}", spoken_text);
+                log::info!("PipelineReady (legacy): {}", spoken_text);
 
                 if let Some(s) = self.voice_state.apply(VoiceStateTransition::ResponseReady) {
                     self.voice_state = s;
                     self.render_state.voice_state = self.voice_state;
                 }
 
-                // Drift-compensate: CU coordinates are anchored to the screenshot taken at
-                // hotkey release. Add the delta between then and now so the cursor targets the
-                // current visual position of the element.
                 let current = self.cursor_tracker.get_position();
                 let drift_x = (current.0 - self.mouse_pos_at_release.0) as f64;
                 let drift_y = (current.1 - self.mouse_pos_at_release.1) as f64;
@@ -714,13 +795,8 @@ impl OverlayApp {
                 let adjusted_coord = coordinate.and_then(|(cx, cy)| {
                     let ax = cx + drift_x;
                     let ay = cy + drift_y;
-                    // Reject NaN, Inf, or anything outside the overlay bounds.
-                    if ax.is_finite()
-                        && ay.is_finite()
-                        && ax >= 0.0
-                        && ay >= 0.0
-                        && ax < self.screen_w as f64
-                        && ay < self.screen_h as f64
+                    if ax.is_finite() && ay.is_finite() && ax >= 0.0 && ay >= 0.0
+                        && ax < self.screen_w as f64 && ay < self.screen_h as f64
                     {
                         Some((ax, ay))
                     } else {
@@ -740,35 +816,232 @@ impl OverlayApp {
                 self.render_state.speech_bubble_text =
                     crate::core::bubble_text::pick_bubble_phrase(is_pointing);
 
-                // Play TTS — empty mp3_bytes means TTS was disabled or failed.
-                if mp3_bytes.is_empty() {
-                    log::warn!("TTS unavailable — falling back to espeak-ng");
-                    let spoken_clean: String = spoken_text
-                        .chars()
-                        .filter(|&c| c != '\0')
-                        .take(500)
-                        .collect();
-                    if !spoken_clean.is_empty() {
-                        std::thread::spawn(move || {
-                            let _ = std::process::Command::new("espeak-ng")
-                                .arg(&spoken_clean)
-                                .status();
-                        });
-                    }
-                } else if let Some(p) = &mut self.audio_player {
-                    p.play_mp3(mp3_bytes);
-                    log::info!("TTS playback started");
-                }
-
-                self.responding_since = Some(std::time::Instant::now());
+                self.play_tts(mp3_bytes, &spoken_text);
+                self.responding_since = Some(Instant::now());
                 self.cu_coordinate_pending = false;
                 self.cu_pending_since = None;
                 self.claude_pipeline_active = false;
                 self.processing_since = None;
-                let _ = display_infos; // consumed by coordinate mapping above
+                let _ = display_infos;
+            }
+            UiEvent::PipelineReadyWithIntent { spoken_text, mp3_bytes, intent, display_infos } => {
+                if self.voice_state != VoiceState::Processing {
+                    log::warn!(
+                        "[PIPELINE] PipelineReadyWithIntent arrived but state={:?} — discarding",
+                        self.voice_state
+                    );
+                    return;
+                }
+                log::info!(
+                    "[PIPELINE] PipelineReadyWithIntent: spoken='{}' intent={:?}",
+                    spoken_text,
+                    intent.as_ref().map(|i| (&i.label, &i.region_hint))
+                );
+
+                if let Some(s) = self.voice_state.apply(VoiceStateTransition::ResponseReady) {
+                    self.voice_state = s;
+                    self.render_state.voice_state = self.voice_state;
+                }
+
+                self.play_tts(mp3_bytes, &spoken_text);
+                self.responding_since = Some(Instant::now());
+                self.claude_pipeline_active = false;
+                self.processing_since = None;
+
+                self.render_state.speech_bubble_text =
+                    crate::core::bubble_text::pick_bubble_phrase(intent.is_some());
+
+                if let Some(intent) = intent {
+                    // Determine which display (screenshot index) to use for CU fallback.
+                    // Default to the cursor display index, or 0 if unknown.
+                    let screenshot_index = display_infos
+                        .iter()
+                        .position(|d| d.is_cursor_display)
+                        .unwrap_or(0);
+
+                    let cursor_ss_index = screenshot_index;
+
+                    // Try local UI-map match now.
+                    // If no map is built yet (race condition), immediately fire CU fallback.
+                    if let Some(ui_map) = &self.last_ui_map {
+                        println!("UI elements count: {}", ui_map.elements.len());
+                        let cursor_pos_ss = self.screenshot_space_cursor(cursor_ss_index, &display_infos);
+                        let match_result = crate::ui_map::match_intent(ui_map, &intent, cursor_pos_ss);
+
+                        println!("UI MAP RESULT: {:?}", match_result.as_ref().map(|m| (m.score, m.element.center_x, m.element.center_y)));
+
+                        if let Some(ref m) = match_result {
+                            println!("Best match score: {:.3}", m.score);
+                        } else {
+                            println!("Best match score: below threshold — firing CU fallback");
+                        }
+
+                        if let Some(m) = match_result {
+                            // Confidence gate already enforced inside match_intent.
+                            log::info!(
+                                "UI-map match: '{}' score={:.2} at ss=({:.0},{:.0})",
+                                intent.label, m.score, m.element.center_x, m.element.center_y
+                            );
+                            if let Some(global_coord) = self.map_element_to_global(&m.element, cursor_ss_index, &display_infos) {
+                                if self.is_valid_coordinate(global_coord, &display_infos) {
+                                    log::info!(
+                                        "[FINAL PIPELINE] ui-map ss=({:.0},{:.0}) → global=({:.0},{:.0}) label='{}'",
+                                        m.element.center_x, m.element.center_y,
+                                        global_coord.0, global_coord.1,
+                                        intent.label,
+                                    );
+                                    println!("FINAL COORDINATE USED: x={:.0} y={:.0}", global_coord.0, global_coord.1);
+                                    self.start_flight_global(global_coord, &spoken_text);
+                                    self.cu_coordinate_pending = false;
+                                    self.cu_pending_since = None;
+                                    return;
+                                }
+                            }
+                        }
+                    } else {
+                        println!("UI elements count: 0 (no UI map built yet)");
+                    }
+
+                    // UI-map match failed or no map yet — fire CU fallback.
+                    log::info!(
+                        "[CU-FALLBACK] UI-map miss for '{}' — firing RequestCUCoordinate (display_index={})",
+                        intent.label, screenshot_index
+                    );
+                    println!("UI MAP FAILED → triggering CU fallback");
+                    log::info!("UI-map miss for '{}', requesting CU coordinate", intent.label);
+                    self.pending_intent = Some(intent.clone());
+                    self.api_adapter.send(ClientMessage::RequestCUCoordinate {
+                        intent,
+                        screenshot_index,
+                    });
+                    self.cu_coordinate_pending = true;
+                    self.cu_pending_since = Some(Instant::now());
+                    log::info!("[CU-FALLBACK] cu_coordinate_pending=true, timer started");
+                } else {
+                    self.cu_coordinate_pending = false;
+                    self.cu_pending_since = None;
+                }
+
+                let _ = display_infos;
+            }
+            UiEvent::CUCoordinateReady { coordinate } => {
+                log::info!("[CU] CUCoordinateReady received: {:?}", coordinate);
+
+                // Guard against double execution: only act if CU was actually pending.
+                if !self.cu_coordinate_pending {
+                    log::warn!("[CU] CUCoordinateReady arrived but cu_coordinate_pending=false; discarding");
+                    return;
+                }
+                self.cu_coordinate_pending = false;
+                self.cu_pending_since = None;
+                log::info!("[CU] cu_coordinate_pending cleared");
+
+                let raw_coord = if let Some((raw_cx, raw_cy)) = coordinate {
+                    (raw_cx, raw_cy)
+                } else {
+                    // CU found no element — use last-resort fallback (current cursor position).
+                    println!("All detection paths failed — using fallback");
+                    log::warn!("CU found no element — using current cursor position as last-resort fallback");
+                    let pos = self.cursor_tracker.get_position();
+                    let lbl = self.pending_intent.as_ref().map(|i| i.label.clone()).unwrap_or_default();
+                    self.start_flight_global((pos.0 as f64, pos.1 as f64), &lbl);
+                    return;
+                };
+
+                let (raw_cx, raw_cy) = raw_coord;
+                println!("CU raw coordinate: {:?}", (raw_cx, raw_cy));
+
+                // Snap raw CU coordinate to nearest UI element.
+                // On snap failure, fall back to the raw CU coordinate rather than silently doing nothing.
+                let snapped = if let Some(ui_map) = &self.last_ui_map {
+                    // CU coordinate is already in global display space.  Convert to
+                    // screenshot-pixel space for snap_to_nearest_ui_element.
+                    let display_infos = self.last_display_infos.as_deref().unwrap_or(&[]);
+                    let ss_coord = self.global_to_screenshot_space((raw_cx, raw_cy), display_infos);
+                    if let Some(ss) = ss_coord {
+                        log::info!(
+                            "[SNAP] CU raw=({:.0},{:.0}) → ss=({:.0},{:.0}) radius={}px",
+                            raw_cx, raw_cy, ss.0, ss.1, SNAP_RADIUS_PX as u32
+                        );
+                        if let Some(snapped_ss) = snap_to_nearest_ui_element(ss, ui_map, SNAP_RADIUS_PX) {
+                            log::info!(
+                                "[SNAP] snapped ss=({:.0},{:.0}) → ss_snapped=({:.0},{:.0}) Δ=({:.1},{:.1})",
+                                ss.0, ss.1, snapped_ss.0, snapped_ss.1,
+                                snapped_ss.0 - ss.0, snapped_ss.1 - ss.1,
+                            );
+                            println!("Snapped coordinate: {:?}", snapped_ss);
+                            // Convert snapped screenshot-space back to global.
+                            let display_infos_vec: Vec<DisplayInfo> = display_infos.to_vec();
+                            let cursor_idx = display_infos_vec.iter().position(|d| d.is_cursor_display).unwrap_or(0);
+                            let element = crate::ui_map::UiElement {
+                                label: None,
+                                center_x: snapped_ss.0,
+                                center_y: snapped_ss.1,
+                                width: 1.0,
+                                height: 1.0,
+                            };
+                            self.map_element_to_global(&element, cursor_idx, &display_infos_vec)
+                                .unwrap_or((raw_cx, raw_cy))
+                        } else {
+                            // No UI element within snap radius — use raw CU coordinate.
+                            log::info!(
+                                "[SNAP] no UI element within {}px of ss=({:.0},{:.0}) — using raw CU coordinate",
+                                SNAP_RADIUS_PX as u32, ss.0, ss.1
+                            );
+                            println!("No nearby UI element for CU coordinate (snap radius {}px)", SNAP_RADIUS_PX);
+                            log::warn!("CU snap: no UI element within {}px — using raw CU coordinate", SNAP_RADIUS_PX);
+                            (raw_cx, raw_cy)
+                        }
+                    } else {
+                        // Can't convert to screenshot space — use raw coordinate.
+                        log::warn!("[SNAP] global_to_screenshot_space failed for ({:.0},{:.0}) — using raw", raw_cx, raw_cy);
+                        (raw_cx, raw_cy)
+                    }
+                } else {
+                    log::warn!("[SNAP] no UI map available — using raw CU coordinate ({:.0},{:.0})", raw_cx, raw_cy);
+                    (raw_cx, raw_cy)
+                };
+
+                // Apply drift compensation using the freshest cursor position.
+                let current = self.cursor_tracker.get_position();
+                let drift_x = (current.0 - self.mouse_pos_at_release.0) as f64;
+                let drift_y = (current.1 - self.mouse_pos_at_release.1) as f64;
+                let drifted = (snapped.0 + drift_x, snapped.1 + drift_y);
+
+                let display_infos_vec = self.last_display_infos.clone().unwrap_or_default();
+                if display_infos_vec.is_empty() {
+                    log::warn!("[CU] last_display_infos is empty during CUCoordinateReady — coordinate mapping will use (0,0) origin");
+                }
+                let final_coord = if self.is_valid_coordinate(drifted, &display_infos_vec) {
+                    log::info!(
+                        "[CU] coordinate passed validation: snapped=({:.0},{:.0}) drift=({:.1},{:.1}) final=({:.0},{:.0})",
+                        snapped.0, snapped.1, drift_x, drift_y, drifted.0, drifted.1
+                    );
+                    drifted
+                } else {
+                    // Safety validation failed — use snapped coordinate without drift rather
+                    // than falling back to cursor position, which would completely miss the target.
+                    log::warn!(
+                        "[CU] drifted coordinate ({:.0},{:.0}) failed validation — using snapped ({:.0},{:.0}) without drift",
+                        drifted.0, drifted.1, snapped.0, snapped.1
+                    );
+                    snapped
+                };
+
+                // Use the speech bubble text that was set when PipelineReadyWithIntent arrived.
+                let label = self.pending_intent.as_ref().map(|i| i.label.clone()).unwrap_or_default();
+                log::info!(
+                    "[FINAL PIPELINE] raw=({:.0},{:.0}) → snapped=({:.0},{:.0}) → drifted=({:.0},{:.0}) → cursor=({:.0},{:.0}) label='{}'",
+                    raw_cx, raw_cy,
+                    snapped.0, snapped.1,
+                    drifted.0, drifted.1,
+                    final_coord.0, final_coord.1,
+                    label,
+                );
+                println!("FINAL COORDINATE USED: x={:.0} y={:.0}", final_coord.0, final_coord.1);
+                self.start_flight_global(final_coord, &label);
             }
             UiEvent::TtsError(err) => {
-                // TtsError is no longer produced by the new pipeline; kept for forward-compat.
                 log::warn!("TTS error (legacy): {err}");
             }
             UiEvent::PipelineError(err) => {
@@ -779,5 +1052,195 @@ impl OverlayApp {
                 self.claude_pipeline_active = false;
             }
         }
+    }
+
+    /// Plays TTS audio or falls back to espeak-ng.
+    fn play_tts(&mut self, mp3_bytes: Vec<u8>, spoken_text: &str) {
+        if mp3_bytes.is_empty() {
+            log::warn!("TTS unavailable — falling back to espeak-ng");
+            let spoken_clean: String = spoken_text
+                .chars()
+                .filter(|&c| c != '\0')
+                .take(500)
+                .collect();
+            if !spoken_clean.is_empty() {
+                std::thread::spawn(move || {
+                    let _ = std::process::Command::new("espeak-ng")
+                        .arg(&spoken_clean)
+                        .status();
+                });
+            }
+        } else if let Some(p) = &mut self.audio_player {
+            p.play_mp3(mp3_bytes);
+            log::info!("TTS playback started");
+        }
+    }
+
+    /// Starts the bezier flight animation to a global display coordinate.
+    fn start_flight_global(&mut self, global: (f64, f64), spoken_text: &str) {
+        let local_x = global.0 - self.overlay_x as f64;
+        let local_y = global.1 - self.overlay_y as f64;
+        log::info!(
+            "[FINAL PIPELINE] global=({:.0},{:.0}) overlay_origin=({},{}) → local=({:.0},{:.0}) label='{}'",
+            global.0, global.1,
+            self.overlay_x, self.overlay_y,
+            local_x, local_y,
+            spoken_text
+        );
+        self.render_state.start_flight_to(local_x, local_y, spoken_text.to_owned());
+    }
+
+    /// Maps a `UiElement` (in screenshot-pixel space) to global display coordinates.
+    ///
+    /// Single-source transform (no double-scaling):
+    ///   norm_x  = center_x / screenshot_width_pixels          (0..1)
+    ///   norm_y  = center_y / screenshot_height_pixels         (0..1)
+    ///   local_x = norm_x * display_width_points               (logical pts on this display)
+    ///   local_y = norm_y * display_height_points
+    ///   global  = (origin_x + local_x, origin_y + local_y)   (global physical px)
+    fn map_element_to_global(
+        &self,
+        element: &crate::ui_map::UiElement,
+        screenshot_index: usize,
+        display_infos: &[DisplayInfo],
+    ) -> Option<(f64, f64)> {
+        let display = display_infos.get(screenshot_index)?;
+        let ss_w = display.screenshot_width_pixels as f64;
+        let ss_h = display.screenshot_height_pixels as f64;
+        if ss_w <= 0.0 || ss_h <= 0.0 {
+            log::warn!("[MAP] display[{}] screenshot dims are zero — cannot map", screenshot_index);
+            return None;
+        }
+        if display.display_width_points <= 0.0 || display.display_height_points <= 0.0 {
+            log::warn!("[MAP] display[{}] logical size is zero — DPI info missing", screenshot_index);
+            return None;
+        }
+        let norm_x = element.center_x / ss_w;
+        let norm_y = element.center_y / ss_h;
+        let local_x = norm_x * display.display_width_points;
+        let local_y = norm_y * display.display_height_points;
+        let global_x = display.global_origin_x + local_x;
+        let global_y = display.global_origin_y + local_y;
+        log::info!(
+            "[MAP] ss=({:.0},{:.0}) ss_size={}x{} → norm=({:.4},{:.4}) → local=({:.0},{:.0}) → global=({:.0},{:.0})",
+            element.center_x, element.center_y,
+            ss_w as u32, ss_h as u32,
+            norm_x, norm_y,
+            local_x, local_y,
+            global_x, global_y,
+        );
+        Some((global_x, global_y))
+    }
+
+    /// Converts a global display coordinate back to screenshot-pixel space on the cursor's display.
+    fn global_to_screenshot_space(
+        &self,
+        global: (f64, f64),
+        display_infos: &[DisplayInfo],
+    ) -> Option<(f64, f64)> {
+        let display = display_infos.iter().find(|d| d.is_cursor_display)?;
+        let local_x = global.0 - display.global_origin_x;
+        let local_y = global.1 - display.global_origin_y;
+        let ss_w = display.screenshot_width_pixels as f64;
+        let ss_h = display.screenshot_height_pixels as f64;
+        if display.display_width_points <= 0.0 || display.display_height_points <= 0.0 {
+            log::warn!("[MAP] global_to_ss: logical display size is zero — DPI info missing");
+            return None;
+        }
+        let ss_x = local_x / display.display_width_points * ss_w;
+        let ss_y = local_y / display.display_height_points * ss_h;
+        log::debug!(
+            "[MAP] global=({:.0},{:.0}) → local=({:.0},{:.0}) → ss=({:.0},{:.0}) (scale {:.3}x{:.3})",
+            global.0, global.1, local_x, local_y, ss_x, ss_y,
+            ss_w / display.display_width_points,
+            ss_h / display.display_height_points,
+        );
+        Some((ss_x, ss_y))
+    }
+
+    /// Returns the cursor position in the screenshot-pixel space of the given display.
+    fn screenshot_space_cursor(
+        &self,
+        screenshot_index: usize,
+        display_infos: &[DisplayInfo],
+    ) -> Option<(f64, f64)> {
+        let display = display_infos.get(screenshot_index)?;
+        let cursor = self.cursor_tracker.get_position();
+        let local_x = cursor.0 as f64 - display.global_origin_x;
+        let local_y = cursor.1 as f64 - display.global_origin_y;
+        let ss_w = display.screenshot_width_pixels as f64;
+        let ss_h = display.screenshot_height_pixels as f64;
+        if display.display_width_points <= 0.0 || display.display_height_points <= 0.0 {
+            return None;
+        }
+        let ss_x = local_x / display.display_width_points * ss_w;
+        let ss_y = local_y / display.display_height_points * ss_h;
+        Some((ss_x, ss_y))
+    }
+
+    /// Safety validation gate — rejects coordinates that are likely hallucinated or unsafe.
+    ///
+    /// Rejects when:
+    /// 1. The coordinate is not finite.
+    /// 2. The coordinate matches the geometric screen centre of any display (hallucination guard).
+    ///    Threshold: within 3% of the display's shorter dimension.
+    /// 3. (Only when UI map is available) No edge pixels exist within 15px.
+    /// 4. (Only when UI map is available) No UI element bounding box is within 20px.
+    ///
+    /// NOTE: guards 3 & 4 are skipped when `last_ui_map` is absent. A missing map means
+    /// the Sobel processing hasn't finished yet — it is not safe to reject on absent data,
+    /// since the CU coordinate is the result of a real model inference.
+    fn is_valid_coordinate(&self, coord: (f64, f64), display_infos: &[DisplayInfo]) -> bool {
+        if !coord.0.is_finite() || !coord.1.is_finite() {
+            log::warn!("[COORD-VALIDATE] ({:.0},{:.0}) is not finite — rejecting", coord.0, coord.1);
+            return false;
+        }
+
+        // Guard 2: screen-centre hallucination.
+        // 3% threshold (was 2%) — catches models that report near-centre rather than exact centre.
+        for d in display_infos {
+            let cx = d.global_origin_x + d.display_width_points / 2.0;
+            let cy = d.global_origin_y + d.display_height_points / 2.0;
+            let dx = coord.0 - cx;
+            let dy = coord.1 - cy;
+            let threshold = d.display_width_points.min(d.display_height_points) * 0.03;
+            if (dx * dx + dy * dy).sqrt() < threshold {
+                log::warn!(
+                    "[COORD-VALIDATE] ({:.0},{:.0}) matches screen centre ({:.0},{:.0}) within {:.0}px — rejecting hallucination",
+                    coord.0, coord.1, cx, cy, threshold
+                );
+                return false;
+            }
+        }
+
+        // Guards 3 & 4 require the UI map. Skip entirely when absent — never reject
+        // a good CU coordinate because the UI map hasn't been built yet.
+        if let Some(ui_map) = &self.last_ui_map {
+            let ss_coord = self.global_to_screenshot_space(coord, display_infos.as_ref());
+            if let Some(ss) = ss_coord {
+                if crate::ui_map::no_edge_pixels_nearby(ss, &ui_map.edge_mask, 15) {
+                    log::warn!(
+                        "[COORD-VALIDATE] ({:.0},{:.0}) → ss({:.0},{:.0}): no edge pixels within 15px — rejecting",
+                        coord.0, coord.1, ss.0, ss.1
+                    );
+                    return false;
+                }
+                if crate::ui_map::no_bounding_box_nearby(ss, ui_map, 20.0) {
+                    log::warn!(
+                        "[COORD-VALIDATE] ({:.0},{:.0}) → ss({:.0},{:.0}): no UI element within 20px — rejecting",
+                        coord.0, coord.1, ss.0, ss.1
+                    );
+                    return false;
+                }
+            }
+        } else {
+            log::info!(
+                "[COORD-VALIDATE] ({:.0},{:.0}): no UI map yet — skipping edge/bbox guards",
+                coord.0, coord.1
+            );
+        }
+
+        log::info!("[COORD-VALIDATE] ({:.0},{:.0}) passed all guards", coord.0, coord.1);
+        true
     }
 }
