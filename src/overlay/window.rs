@@ -62,6 +62,8 @@ pub struct OverlayApp {
     pub elapsed_secs: f64,
     pub refresh_hz: u32,
     pub last_mouse_pos: (f32, f32),
+    // Last cursor position actually sent to the backend — used for delta filtering.
+    pub last_sent_cursor_pos: (f32, f32),
     // Exponentially smoothed mouse velocity (pixels/second) used for prediction.
     pub mouse_velocity: (f32, f32),
     // Per-second timing diagnostics
@@ -265,12 +267,18 @@ impl ApplicationHandler for OverlayApp {
         // Cursor position � winit fallback tracker gets updated via CursorMoved events.
         // The win32 tracker reads GetCursorPos directly, so update_from_window is a no-op.
         let current_mouse = self.cursor_tracker.get_position();
-                // Send cursor position to backend periodically
+        // Send cursor position to backend — only when the cursor has moved > 1 pixel to avoid
+        // flooding the channel at 60fps with identical values.
         if self.frame_count % 6 == 0 {
-            self.api_adapter.send(ClientMessage::CursorPosition {
-                x: current_mouse.0,
-                y: current_mouse.1,
-            });
+            let dx = current_mouse.0 - self.last_sent_cursor_pos.0;
+            let dy = current_mouse.1 - self.last_sent_cursor_pos.1;
+            if dx * dx + dy * dy > 1.0 {
+                self.api_adapter.send(ClientMessage::CursorPosition {
+                    x: current_mouse.0,
+                    y: current_mouse.1,
+                });
+                self.last_sent_cursor_pos = current_mouse;
+            }
         }
 
         // Drain backend events

@@ -27,15 +27,15 @@ static POINT_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Parses Claude's response to extract the spoken portion and any pointing coordinate.
 pub fn parse_claude_response(full_response_text: &str) -> PointingParseResult {
-    let Some(regex_match) = POINT_TAG_REGEX.find(full_response_text) else {
+    let Some(captures) = POINT_TAG_REGEX.captures(full_response_text) else {
         return PointingParseResult {
             spoken_text: full_response_text.trim().to_string(),
             pointing: None,
         };
     };
 
-    let spoken_text = full_response_text[..regex_match.start()].trim().to_string();
-    let captures = POINT_TAG_REGEX.captures(full_response_text).unwrap();
+    let tag_start = captures.get(0).expect("full match always present").start();
+    let spoken_text = full_response_text[..tag_start].trim().to_string();
 
     let pointing = captures.get(1).map(|x_match| {
         let screenshot_pixel_x = x_match.as_str().parse::<f64>().unwrap_or(0.0);

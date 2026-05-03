@@ -23,10 +23,10 @@ const MIN_CHUNK_BYTES: usize = 3200;
 pub async fn run_transcription_bridge(
     audio_rx: std_mpsc::Receiver<Vec<u8>>,
     server_tx: async_mpsc::Sender<ServerMessage>,
+    http_client: reqwest::Client,
     api_key: String,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-    let http_client = reqwest::Client::new();
 
     let token = match assemblyai::fetch_temporary_streaming_token(&http_client, &api_key).await {
         Ok(t) => t,
@@ -95,12 +95,22 @@ pub async fn run_transcription_bridge(
         }
     });
 
-    // Wait for cancel (hotkey released), then drain remaining audio
+    // Wait for cancel (hotkey released), then drain remaining audio.
+    // The 500ms timeout prevents an infinite hang if the audio producer panics or stalls.
     let _ = cancel_rx.await;
-    while let Some(pcm16) = async_audio_rx.recv().await {
-        if audio_sender.send(pcm16).await.is_err() {
-            break;
-        }
+    let drain_result = tokio::time::timeout(
+        tokio::time::Duration::from_millis(500),
+        async {
+            while let Some(pcm16) = async_audio_rx.recv().await {
+                if audio_sender.send(pcm16).await.is_err() {
+                    break;
+                }
+            }
+        },
+    )
+    .await;
+    if drain_result.is_err() {
+        warn!("audio drain timed out after 500ms, proceeding to finalize");
     }
 
     info!("audio drained, requesting final transcript");

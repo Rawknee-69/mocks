@@ -166,6 +166,12 @@ async fn detect_computer_use_coordinate(
 
 #[cfg(debug_assertions)]
 fn log_debug_screenshots(screenshots: &[ScreenshotData], display_infos: &[DisplayInfo]) {
+    // Requires CLICKY_DEBUG_SCREENSHOTS=1 so screenshots are never written unintentionally.
+    // Even in debug builds, /tmp is world-readable on Linux, so we guard behind an explicit opt-in.
+    if std::env::var("CLICKY_DEBUG_SCREENSHOTS").as_deref() != Ok("1") {
+        return;
+    }
+
     for (index, screenshot) in screenshots.iter().enumerate() {
         let path = if cfg!(target_os = "windows") {
             format!(

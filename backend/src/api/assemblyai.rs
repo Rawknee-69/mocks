@@ -221,6 +221,7 @@ impl StreamingTranscriptionSession {
                         if !has_delivered_final {
                             has_delivered_final = true;
                             let full = compose_transcript_from_turns(&stored_turns);
+                            stored_turns.clear();
                             let _ = transcript_sender_clone.send(TranscriptUpdate::Final(full)).await;
                         }
                         break;
@@ -246,6 +247,7 @@ impl StreamingTranscriptionSession {
             // Deliver whatever we have if no explicit Termination was received
             if !has_delivered_final {
                 let full = compose_transcript_from_turns(&stored_turns);
+                stored_turns.clear();
                 if !full.is_empty() {
                     let _ = transcript_sender_clone.send(TranscriptUpdate::Final(full)).await;
                 }

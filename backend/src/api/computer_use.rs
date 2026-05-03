@@ -144,11 +144,8 @@ async fn call_computer_use_api(
         ]
     });
 
-    let payload_mb = serde_json::to_vec(&request_body)
-        .map(|v| v.len())
-        .unwrap_or(0) as f64
-        / 1_048_576.0;
-    debug!("Computer Use: sending {payload_mb:.1}MB (declared {declared_width}x{declared_height})");
+    let payload_mb = (base64_screenshot.len() as f64 / 1_048_576.0) * 1.35;
+    debug!("Computer Use: sending ~{payload_mb:.1}MB estimated (declared {declared_width}x{declared_height})");
 
     let response = match http_client
         .post("https://api.anthropic.com/v1/messages")

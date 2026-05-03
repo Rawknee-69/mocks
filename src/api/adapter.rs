@@ -57,7 +57,7 @@ impl ApiAdapter {
     pub async fn try_connect(port: u16) -> Result<Self, std::io::Error> {
         let url = format!("ws://127.0.0.1:{port}");
         let connect_future = tokio_tungstenite::connect_async(&url);
-        tokio::time::timeout(std::time::Duration::from_secs(2), connect_future)
+        let (ws_stream, _) = tokio::time::timeout(std::time::Duration::from_secs(2), connect_future)
             .await
             .map_err(|_| {
                 std::io::Error::new(
@@ -67,7 +67,11 @@ impl ApiAdapter {
             })?
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.to_string()))?;
 
-        Ok(Self::connect(port))
+        // Reuse the already-established connection rather than discarding it and opening a second one.
+        let (client_tx, client_rx) = async_mpsc::channel::<ClientMessage>(128);
+        let (ui_event_tx, ui_event_rx) = std_mpsc::channel::<UiEvent>();
+        tokio::spawn(ws_task_with_stream(ws_stream, port, client_rx, ui_event_tx));
+        Ok(Self { client_tx, ui_event_rx })
     }
 
     /// Returns the next `UiEvent` if one is available, without blocking.
@@ -103,67 +107,104 @@ async fn ws_task(
         backoff_ms = 250; // reset on successful connection
         info!("adapter: connected to {url}");
 
-        let (mut ws_sink, mut ws_source) = futures_util::StreamExt::split(ws_stream);
+        if !run_ws_connection(ws_stream, &mut client_rx, &ui_event_tx).await {
+            return; // channel closed — adapter was dropped
+        }
 
-        // Run until the connection drops, then break out to reconnect
-        let disconnect = loop {
-            tokio::select! {
-                // Outgoing: client_rx → WebSocket
-                outgoing = client_rx.recv() => {
-                    let Some(msg) = outgoing else {
-                        // Channel closed — adapter was dropped, exit task
-                        return;
-                    };
-                    let json = match serde_json::to_string(&msg) {
-                        Ok(j) => j,
-                        Err(err) => {
-                            error!("adapter: failed to serialise ClientMessage: {err}");
-                            continue;
-                        }
-                    };
-                    if futures_util::SinkExt::send(
-                        &mut ws_sink,
-                        tokio_tungstenite::tungstenite::Message::Text(json.into()),
-                    ).await.is_err() {
-                        break true; // disconnect
-                    }
-                }
+        warn!("adapter: disconnected, retrying in {backoff_ms}ms");
+        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+        backoff_ms = (backoff_ms * 2).min(5000);
+    }
+}
 
-                // Incoming: WebSocket → UiEvent
-                incoming = futures_util::StreamExt::next(&mut ws_source) => {
-                    match incoming {
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                            match serde_json::from_str::<ServerMessage>(&text) {
-                                Ok(server_msg) => {
-                                    if let Some(ui_event) = server_message_to_ui_event(server_msg) {
-                                        // Render loop has exited → stop
-                                        if ui_event_tx.send(ui_event).is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    warn!("adapter: failed to parse ServerMessage: {err}");
-                                }
-                            }
-                        }
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
-                            break true; // disconnect
-                        }
-                        Some(Err(err)) => {
-                            warn!("adapter: WS receive error: {err}");
-                            break true;
-                        }
-                        Some(Ok(_)) => {} // ignore binary/ping/pong
+/// Variant of `ws_task` that starts with an already-open `ws_stream` (from `try_connect`)
+/// then reconnects on disconnect like the normal `ws_task`.
+async fn ws_task_with_stream(
+    initial_stream: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    port: u16,
+    mut client_rx: async_mpsc::Receiver<ClientMessage>,
+    ui_event_tx: std_mpsc::Sender<UiEvent>,
+) {
+    info!("adapter: using pre-established connection");
+    if !run_ws_connection(initial_stream, &mut client_rx, &ui_event_tx).await {
+        return;
+    }
+
+    // Connection dropped — fall back to the normal reconnect loop
+    ws_task(port, client_rx, ui_event_tx).await;
+}
+
+/// Drives a single WebSocket connection until it disconnects.
+///
+/// Returns `true` if we should reconnect, `false` if the adapter was dropped (channel closed).
+async fn run_ws_connection(
+    ws_stream: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    client_rx: &mut async_mpsc::Receiver<ClientMessage>,
+    ui_event_tx: &std_mpsc::Sender<UiEvent>,
+) -> bool {
+    const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
+    let (mut ws_sink, mut ws_source) = futures_util::StreamExt::split(ws_stream);
+
+    loop {
+        tokio::select! {
+            // Outgoing: client_rx → WebSocket
+            outgoing = client_rx.recv() => {
+                let Some(msg) = outgoing else {
+                    // Channel closed — adapter was dropped, exit task
+                    return false;
+                };
+                let json = match serde_json::to_string(&msg) {
+                    Ok(j) => j,
+                    Err(err) => {
+                        error!("adapter: failed to serialise ClientMessage: {err}");
+                        continue;
                     }
+                };
+                if futures_util::SinkExt::send(
+                    &mut ws_sink,
+                    tokio_tungstenite::tungstenite::Message::Text(json.into()),
+                ).await.is_err() {
+                    return true; // disconnect
                 }
             }
-        };
 
-        if disconnect {
-            warn!("adapter: disconnected, retrying in {backoff_ms}ms");
-            tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
-            backoff_ms = (backoff_ms * 2).min(5000);
+            // Incoming: WebSocket → UiEvent
+            incoming = futures_util::StreamExt::next(&mut ws_source) => {
+                match incoming {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        if text.len() > MAX_MESSAGE_BYTES {
+                            warn!("adapter: oversized message ({} bytes), dropping", text.len());
+                            continue;
+                        }
+                        match serde_json::from_str::<ServerMessage>(&text) {
+                            Ok(server_msg) => {
+                                if let Some(ui_event) = server_message_to_ui_event(server_msg) {
+                                    // Render loop has exited → stop
+                                    if ui_event_tx.send(ui_event).is_err() {
+                                        return false;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                warn!("adapter: failed to parse ServerMessage: {err}");
+                            }
+                        }
+                    }
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
+                        return true; // disconnect
+                    }
+                    Some(Err(err)) => {
+                        warn!("adapter: WS receive error: {err}");
+                        return true;
+                    }
+                    Some(Ok(_)) => {} // ignore binary/ping/pong
+                }
+            }
         }
     }
 }

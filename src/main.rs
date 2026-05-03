@@ -161,6 +161,7 @@ fn main() {
             std::time::Duration::from_secs_f64(1.0 / hz as f64)
         },
         last_mouse_pos: (0.0, 0.0),
+        last_sent_cursor_pos: (0.0, 0.0),
         mouse_velocity: (0.0, 0.0),
         diag_last_log_at: Instant::now(),
         diag_frame_intervals_ms: Vec::with_capacity(600),

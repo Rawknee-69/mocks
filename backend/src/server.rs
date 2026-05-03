@@ -9,10 +9,14 @@ use crate::error::AppError;
 use crate::handlers::{llm_pipeline, transcription};
 use clicky_types::{ClientMessage, DisplayInfo, ScreenshotData, ServerMessage};
 use futures_util::{SinkExt, StreamExt};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{
+    accept_async_with_config,
+    tungstenite::{protocol::WebSocketConfig, Message},
+};
 use tracing::{error, info, warn};
 
 /// Binds on `127.0.0.1:port` and accepts incoming connections.
@@ -36,7 +40,10 @@ pub async fn run(port: u16) {
 
 /// Handles a single WebSocket connection end-to-end.
 async fn handle_connection(tcp_stream: TcpStream) {
-    let ws_stream = match accept_async(tcp_stream).await {
+    let ws_config = WebSocketConfig::default()
+        .max_message_size(Some(32 * 1024 * 1024))
+        .max_frame_size(Some(32 * 1024 * 1024));
+    let ws_stream = match accept_async_with_config(tcp_stream, Some(ws_config)).await {
         Ok(ws) => ws,
         Err(err) => {
             warn!("WebSocket handshake failed: {err}");
@@ -65,7 +72,7 @@ async fn handle_connection(tcp_stream: TcpStream) {
 
     let mut active_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
     let mut audio_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>> = None;
-    let mut conversation_history: Vec<(String, String)> = Vec::new();
+    let mut conversation_history: VecDeque<(String, String)> = VecDeque::new();
     let mut last_transcript: Option<String> = None;
     let mut cursor_position: (f32, f32) = (0.0, 0.0);
     let mut pending_screenshots: Option<(Vec<ScreenshotData>, Vec<DisplayInfo>)> = None;
@@ -115,6 +122,7 @@ async fn handle_connection(tcp_stream: TcpStream) {
                     &mut cursor_position,
                     &mut pending_screenshots,
                     &assemblyai_key,
+                    &http_client,
                     pipeline_tx.clone(),
                     &server_tx,
                 ).await;
@@ -148,7 +156,8 @@ async fn handle_connection(tcp_stream: TcpStream) {
                             };
                             let client = http_client.clone();
                             let tx = pipeline_tx.clone();
-                            let history = conversation_history.clone();
+                            let history: Vec<(String, String)> =
+                                conversation_history.iter().cloned().collect();
                             let (screenshots, display_infos) = pending_screenshots
                                 .take()
                                 .unwrap_or_default();
@@ -162,10 +171,10 @@ async fn handle_connection(tcp_stream: TcpStream) {
                 // Track LlmResponse to update conversation history
                 if let ServerMessage::LlmResponse { ref spoken_text, .. } = message {
                     if let Some(ref transcript) = last_transcript {
-                        conversation_history.push((transcript.clone(), spoken_text.clone()));
+                        conversation_history.push_back((transcript.clone(), spoken_text.clone()));
                         // Keep last 10 exchanges
                         if conversation_history.len() > 10 {
-                            conversation_history.remove(0);
+                            conversation_history.pop_front();
                         }
                     }
                 }
@@ -189,6 +198,7 @@ async fn handle_client_message(
     cursor_position: &mut (f32, f32),
     pending_screenshots: &mut Option<(Vec<ScreenshotData>, Vec<DisplayInfo>)>,
     assemblyai_key: &Option<String>,
+    http_client: &reqwest::Client,
     pipeline_tx: mpsc::Sender<ServerMessage>,
     server_tx: &mpsc::Sender<ServerMessage>,
 ) {
@@ -217,6 +227,7 @@ async fn handle_client_message(
             tokio::spawn(transcription::run_transcription_bridge(
                 audio_std_rx,
                 pipeline_tx,
+                http_client.clone(),
                 api_key,
                 cancel_rx,
             ));
