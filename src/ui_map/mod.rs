@@ -65,7 +65,7 @@ impl std::fmt::Display for UiMapError {
 /// Sobel edge threshold.  Higher = fewer edges, fewer false-positive blobs.
 const EDGE_THRESHOLD: u8 = 30;
 /// Discard blobs smaller than this area (px²).
-const MIN_BLOB_AREA: u32 = 50;
+const MIN_BLOB_AREA: u32 = 10;
 /// Discard blobs larger than this area (px²).
 const MAX_BLOB_AREA: u32 = 200_000;
 /// Acceptable aspect ratio range: width / height.
@@ -209,10 +209,11 @@ pub fn match_intent(
     let mut best_element: Option<UiElement> = None;
 
     for (i, el) in map.elements.iter().enumerate() {
-        // Size filter: reject elements too small to be interactive targets.
-        if el.width < 20.0 || el.height < 20.0 {
+        // Reject only degenerate blobs (< 6px in either dimension).
+        // Browser icons are 16–36px — the old 20×20 floor was deleting correct elements.
+        if el.width < 6.0 || el.height < 6.0 {
             println!(
-                "Candidate {}: REJECTED (too small {:.0}×{:.0})",
+                "Candidate {}: REJECTED (degenerate {:.0}×{:.0})",
                 i, el.width, el.height
             );
             continue;
@@ -247,12 +248,17 @@ pub fn match_intent(
             0.0f32
         };
 
-        // size_weight: prefer elements whose height falls in the typical button range (24–80 px).
+        // size_weight: prefer elements whose height falls in interactive size ranges.
+        // 24–80px = typical buttons; 12–24px = icons; 80–120px = still plausible.
         let h = el.height as f32;
         let size_w = if h >= 24.0 && h <= 80.0 {
             0.20
-        } else if h >= 16.0 && h <= 120.0 {
+        } else if h >= 12.0 && h <= 24.0 {
+            0.18
+        } else if h > 80.0 && h <= 120.0 {
             0.10
+        } else if h >= 6.0 && h < 12.0 {
+            0.08
         } else {
             0.0
         };

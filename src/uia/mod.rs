@@ -41,10 +41,36 @@ pub fn extract_ui_tree() -> Vec<UIElement> {
     Vec::new()
 }
 
-/// Scored UIA match — combines name similarity, control type match, and region proximity.
+/// Strips noise words ("button", "icon", "tab") so "New tab button" and "New tab"
+/// compare on their semantic core tokens.
+fn normalize_label(label: &str) -> String {
+    label
+        .to_lowercase()
+        .replace("button", "")
+        .replace("icon", "")
+        .replace("tab", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Token-level match: fraction of `a` tokens found in `b`.
+fn token_match(a: &str, b: &str) -> f64 {
+    let a_tokens: Vec<&str> = a.split_whitespace().collect();
+    let b_tokens: Vec<&str> = b.split_whitespace().collect();
+
+    if a_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let matches = a_tokens.iter().filter(|at| b_tokens.iter().any(|bt| *at == bt)).count();
+    matches as f64 / a_tokens.len() as f64
+}
+
+/// Scored UIA match — combines token-based name similarity, control type, region
+/// proximity, keyword boosting, and top-bar heuristic.
 ///
-/// Returns the best-scoring element above the threshold (0.4).
-/// This replaces the weak token-based substring matching that matched garbage elements.
+/// Returns the best-scoring element above the hard threshold (0.75).
 pub fn scored_match<'a>(
     elements: &'a [UIElement],
     label: &str,
@@ -58,7 +84,7 @@ pub fn scored_match<'a>(
     }
 
     let label_lower = label.to_lowercase();
-    let label_tokens: Vec<&str> = label_lower.split_whitespace().collect();
+    let label_norm = normalize_label(label);
 
     let mut best_score = 0.0f64;
     let mut best_element: Option<&UIElement> = None;
@@ -70,27 +96,30 @@ pub fn scored_match<'a>(
         }
 
         let name_lower = el.name.to_lowercase();
+        let name_norm = normalize_label(&el.name);
 
-        // Name scoring: exact match = 1.0, contains full label = 0.85,
-        // fraction of matching tokens otherwise
+        // ── Name scoring ──
+        // Exact raw match is perfect; exact normalized match is near-perfect.
+        // Then token_match on normalized forms, and containment as baseline.
         let name_score = if name_lower == label_lower {
             1.0
+        } else if name_norm == label_norm && !name_norm.is_empty() {
+            0.95
         } else if name_lower.contains(&label_lower) || label_lower.contains(&name_lower) {
             0.85
         } else {
-            let matching = label_tokens.iter().filter(|t| name_lower.contains(*t)).count();
-            if matching == 0 {
-                0.0
-            } else {
-                matching as f64 / label_tokens.len() as f64 * 0.7
-            }
+            let norm_tok = token_match(&label_norm, &name_norm);
+            let raw_tok = token_match(&label_lower, &name_lower);
+            let best_tok = norm_tok.max(raw_tok);
+            if best_tok > 0.0 { best_tok * 0.85 } else { 0.0 }
         };
 
         if name_score < 0.1 {
+            log::trace!("[UIA_MATCH] SKIP el='{}' name_score={:.2} (below 0.1)", el.name, name_score);
             continue;
         }
 
-        // Role scoring: matching control type is a strong signal
+        // ── Role scoring ──
         let role_score = if let Some(role) = role_hint {
             let role_lower = role.to_lowercase();
             if el.control_type.to_lowercase().contains(&role_lower) {
@@ -99,14 +128,13 @@ pub fn scored_match<'a>(
                 0.0
             }
         } else {
-            // Prefer interactive types even without a role hint
             match el.control_type.as_str() {
-                "Button" | "MenuItem" | "TabItem" | "Hyperlink" | "CheckBox" => 0.5,
+                "Button" | "MenuItem" | "TabItem" | "Hyperlink" | "CheckBox" | "SplitButton" => 0.5,
                 _ => 0.0,
             }
         };
 
-        // Region scoring
+        // ── Region scoring ──
         let region_score = if let Some(hint) = region_hint {
             let center = el.center();
             if point_in_region(center, screen_width, screen_height, hint) {
@@ -118,19 +146,53 @@ pub fn scored_match<'a>(
             0.0
         };
 
-        let score = name_score * 0.50 + role_score * 0.30 + region_score * 0.20;
+        let mut score = name_score * 0.70 + role_score * 0.20 + region_score * 0.10;
+
+        // ── Keyword boost ──
+        // High-confidence semantic keywords that are strong UIA labels.
+        let keywords = [
+            "new tab", "close", "minimize", "maximize", "zoom",
+            "back", "forward", "reload", "refresh", "search",
+            "settings", "menu", "file", "edit", "view", "help",
+        ];
+        for kw in &keywords {
+            if name_lower.contains(kw) && label_lower.contains(kw) {
+                score += 0.15;
+                break;
+            }
+        }
+
+        // ── Top-bar heuristic ──
+        // Browser chrome elements live in the top ~120px. Boost when the region
+        // hint mentions "top".
+        if let Some(hint) = region_hint {
+            if hint.to_lowercase().contains("top") && el.center().y < 120.0 {
+                score += 0.10;
+            }
+        }
+
+        log::trace!(
+            "[UIA_MATCH] el='{}' type='{}' normalized='{}' intent_norm='{}' name={:.2} role={:.2} region={:.2} total={:.2}",
+            el.name, el.control_type, name_norm, label_norm, name_score, role_score, region_score, score,
+        );
 
         if score > best_score {
             best_score = score;
             best_element = Some(el);
             best_desc = format!(
-                "name={:.2} role={:.2} region={:.2} total={:.2} el='{}' type='{}'",
-                name_score, role_score, region_score, score, el.name, el.control_type
+                "name={:.2} role={:.2} region={:.2} total={:.2} el='{}' type='{}' norm='{}'→'{}'",
+                name_score, role_score, region_score, score, el.name, el.control_type, label_norm, name_norm,
             );
         }
     }
 
-    if best_score < 0.4 {
+    log::info!(
+        "[UIA_MATCH] intent='{}' best_score={:.2} threshold=0.75 result={}",
+        label, best_score,
+        if best_score >= 0.75 { "ACCEPT" } else { "REJECT" },
+    );
+
+    if best_score < 0.75 {
         return None;
     }
 
@@ -162,19 +224,27 @@ fn point_in_region(p: crate::core::coords::PointL, screen_w: f64, screen_h: f64,
     false
 }
 
-/// Case-insensitive substring match on element name.
+/// Case-insensitive token-normalized match on element name.
 pub fn match_by_label<'a>(elements: &'a [UIElement], label: &str) -> Option<&'a UIElement> {
-    let lower = label.to_lowercase();
-    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    let label_norm = normalize_label(label);
+    let label_lower = label.to_lowercase();
+    let tokens: Vec<&str> = label_lower.split_whitespace().collect();
 
     elements.iter().filter(|el| !el.name.is_empty()).max_by_key(|el| {
         let name_lower = el.name.to_lowercase();
+        let name_norm = normalize_label(&el.name);
+
+        let exact_normalized: usize = if name_norm == label_norm && !label_norm.is_empty() { 200 } else { 0 };
+        let exact_bonus: usize = if name_lower == label_lower { 100 } else { 0 };
         let matching_tokens = tokens.iter().filter(|t| name_lower.contains(*t)).count();
-        let exact_bonus: usize = if name_lower == lower { 100 } else { 0 };
-        matching_tokens + exact_bonus
+
+        matching_tokens + exact_bonus + exact_normalized
     }).filter(|el| {
         let name_lower = el.name.to_lowercase();
-        tokens.iter().any(|t| name_lower.contains(t))
+        let name_norm = normalize_label(&el.name);
+        let norm_match = !label_norm.is_empty() && name_norm == label_norm;
+        let token_match = tokens.iter().any(|t| name_lower.contains(t));
+        norm_match || token_match
     })
 }
 

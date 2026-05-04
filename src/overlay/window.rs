@@ -913,6 +913,7 @@ impl OverlayApp {
                     // ── UIA-first decision logic ──
                     // Rebuild ScreenModel with latest data before trying UIA match.
                     self.rebuild_screen_model();
+                    let uia_had_elements = self.last_uia_elements.len() > 0;
                     if let Some(ref screen_model) = self.last_screen_model {
                         if let Some((uia_coord, match_desc)) = screen_model.try_uia_match(
                             &intent.label,
@@ -952,12 +953,24 @@ impl OverlayApp {
                                 log::warn!("[UIA-MATCH] coordinate ({:.0},{:.0}) outside bounds — falling through to vision", snapped.x, snapped.y);
                             }
                         } else {
-                            crate::pipeline_log::log_decision("UIA", &intent.label, "no match");
+                            crate::pipeline_log::log_decision("UIA", &intent.label, &format!(
+                                "no match (uia_count={}, all below 0.75 threshold)", self.last_uia_elements.len()
+                            ));
                         }
                     }
 
                     // ── Vision fallback ──
-                    if let Some(ui_map) = &self.last_ui_map {
+                    // Only use vision if UIA had no elements OR no UIA match met the
+                    // strict 0.75 threshold. If UIA elements exist but couldn't match,
+                    // skip vision (it picks random blobs) and go straight to CU.
+                    let skip_vision = uia_had_elements;
+                    if skip_vision {
+                        log::info!(
+                            "[VISION-SKIP] UIA had {} elements but no match — skipping vision (unreliable), going to CU",
+                            self.last_uia_elements.len(),
+                        );
+                        crate::pipeline_log::log_decision("VISION", &intent.label, "skipped (UIA elements present but no match)");
+                    } else if let Some(ui_map) = &self.last_ui_map {
                         let cursor_pos_ss = self.screenshot_space_cursor(cursor_ss_index, &display_infos);
                         let match_result = crate::ui_map::match_intent(ui_map, &intent, cursor_pos_ss);
 

@@ -113,6 +113,13 @@ pub fn log_decision(path: &str, label: &str, detail: &str) {
     append(&format!("[DECISION] path={path} label='{label}' {detail}"));
 }
 
+pub fn log_uia_match(intent: &str, candidate: &str, normalized_intent: &str, normalized_candidate: &str, score: f64, accepted: bool) {
+    let status = if accepted { "ACCEPT" } else { "REJECT" };
+    append(&format!(
+        "[UIA_MATCH] intent='{intent}' candidate='{candidate}' norm_intent='{normalized_intent}' norm_candidate='{normalized_candidate}' score={score:.2} {status}",
+    ));
+}
+
 pub fn log_raw(section: &str, message: &str) {
     append(&format!("[{section}] {message}"));
 }
