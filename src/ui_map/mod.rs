@@ -64,20 +64,26 @@ impl std::fmt::Display for UiMapError {
 
 /// Sobel edge threshold.  Higher = fewer edges, fewer false-positive blobs.
 const EDGE_THRESHOLD: u8 = 30;
-/// Discard blobs smaller than this area (px²).
-const MIN_BLOB_AREA: u32 = 10;
+/// Discard blobs smaller than this area (px²).  Lowered to catch micro-icons
+/// like + / − / × which can be as small as 8–14px per side (~64px² area).
+const MIN_BLOB_AREA: u32 = 4;
 /// Discard blobs larger than this area (px²).
 const MAX_BLOB_AREA: u32 = 200_000;
-/// Acceptable aspect ratio range: width / height.
-const MIN_ASPECT: f32 = 0.15;
-const MAX_ASPECT: f32 = 6.0;
+/// Acceptable aspect ratio range: width / height.  Widened to keep long thin
+/// toolbar separators, pill-shaped tabs, and narrow icon strips.
+const MIN_ASPECT: f32 = 0.1;
+const MAX_ASPECT: f32 = 10.0;
 /// Mandatory minimum score for a match to be accepted.
-/// Lowered from 0.80 → 0.65: the region_hint + cursor_bias path can now
-/// satisfy the gate without requiring OCR text similarity.
 pub const MATCH_CONFIDENCE_THRESHOLD: f32 = 0.65;
 /// Radius in screenshot pixels for `snap_to_nearest_ui_element`.
-/// Increased from 40 → 90 to absorb CU model coordinate noise and DPI scaling error.
 pub const SNAP_RADIUS_PX: f64 = 90.0;
+/// Maximum y-coordinate (screenshot pixels) for the "top strip" heuristic.
+/// Elements above this line are treated as toolbar/tab-bar candidates.
+const TOP_STRIP_Y: f64 = 120.0;
+/// Two elements are in the same row if their y-centres differ by less than this.
+const ROW_MERGE_TOLERANCE: f64 = 12.0;
+/// Minimum number of elements in a row for it to qualify as a tab/toolbar row.
+const MIN_TAB_ROW_LEN: usize = 5;
 
 // ─── Entry points ─────────────────────────────────────────────────────────────
 
@@ -168,16 +174,18 @@ pub fn build_ui_map(jpeg_bytes: &[u8]) -> Result<UiMap, UiMapError> {
 
 /// Matches an `ElementIntent` against the elements in the map.
 ///
-/// Returns `Some(MatchResult)` only when the best score meets `MATCH_CONFIDENCE_THRESHOLD`.
+/// **Structure-first approach**: instead of scoring every blob independently (which
+/// degenerates into a position lottery when text_score=0 for all candidates), we
+/// first try to resolve the intent via layout reasoning:
 ///
-/// Scoring breakdown (max 1.0+):
-/// - text similarity  : Jaro-Winkler (when OCR labels available)
-/// - region hint      : +0.40 if element centre is in the hinted screen region
-/// - size filter      : elements smaller than 20×20 px are rejected outright
-/// - size weight      : +0.20 / +0.10 for typical button heights
-/// - position bias    : +0.15 for elements in the vertical action zone
-/// - cursor bias      : continuous gradient 0–0.40 based on distance to cursor
-/// - close-button     : top-right corner boost when intent label contains "close"
+/// 1. Group elements into horizontal rows.
+/// 2. Detect tab-bar rows (≥5 elements, all y < TOP_STRIP_Y).
+/// 3. Apply structural rules:
+///    - "new tab" → rightmost element in the tab row.
+///    - "zoom in/out" → detect adjacent same-size pair, pick left/right.
+///    - "close" → top-right corner element.
+/// 4. Only if no structural rule fires, fall back to the old scoring path
+///    (but with cursor_score capped so it can never dominate).
 pub fn match_intent(
     map: &UiMap,
     intent: &ElementIntent,
@@ -193,38 +201,103 @@ pub fn match_intent(
         return None;
     }
 
-    // Pre-compute the max possible distance across the screenshot so the cursor
-    // score is always in [0, 1] regardless of screen resolution.
+    let label_lower = intent.label.to_lowercase();
+
+    // ── Step 1: Group elements into horizontal rows ──
+    let rows = group_by_rows(&map.elements);
+    println!("[STRUCTURE] row_count={}", rows.len());
+
+    // ── Step 2: Detect tab rows (top strip, ≥ MIN_TAB_ROW_LEN elements) ──
+    let tab_rows: Vec<&Vec<&UiElement>> = rows.iter().filter(|r| is_tab_row(r)).collect();
+    let has_tab_row = !tab_rows.is_empty();
+    println!("[STRUCTURE] tab_row_detected={}", has_tab_row);
+
+    // ── Step 3: Structural rules (priority order) ──
+
+    // Rule: "new tab" → rightmost element in the tab row
+    if is_new_tab_intent(&label_lower) {
+        if let Some(tab_row) = tab_rows.first() {
+            if let Some(rightmost) = tab_row.iter().max_by(|a, b| {
+                a.center.x.partial_cmp(&b.center.x).unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                println!(
+                    "[STRUCTURE] intent='new tab' → rightmost in tab row x={:.0} y={:.0}",
+                    rightmost.center.x, rightmost.center.y,
+                );
+                println!("[RESULT] intent=\"{}\" method=\"structure_rule:new_tab\"", intent.label);
+                println!("--- MATCH DEBUG END ---");
+                return Some(MatchResult { element: (*rightmost).clone(), score: 0.95 });
+            }
+        }
+        println!("[STRUCTURE] new_tab rule: no tab row found, falling through");
+    }
+
+    // Rule: "close tab" / "close" → rightmost-but-one in tab row or top-right corner
+    if is_close_intent(&label_lower) {
+        // Try top-right corner element first
+        if let Some(el) = find_top_right_element(&map.elements, map.screenshot_width, map.screenshot_height) {
+            println!(
+                "[STRUCTURE] intent='close' → top-right element x={:.0} y={:.0}",
+                el.center.x, el.center.y,
+            );
+            println!("[RESULT] intent=\"{}\" method=\"structure_rule:close\"", intent.label);
+            println!("--- MATCH DEBUG END ---");
+            return Some(MatchResult { element: el.clone(), score: 0.95 });
+        }
+        println!("[STRUCTURE] close rule: no top-right element found, falling through");
+    }
+
+    // Rule: "zoom in" / "zoom out" → find adjacent same-size pair
+    if is_zoom_intent(&label_lower) {
+        let top_strip: Vec<&UiElement> = map.elements.iter().filter(|e| e.center.y < TOP_STRIP_Y).collect();
+        if let Some((left, right)) = find_zoom_pair(&top_strip) {
+            let pick = if label_lower.contains("in") || label_lower.contains('+') {
+                right
+            } else {
+                left
+            };
+            println!(
+                "[STRUCTURE] intent='zoom' → pair found, picked x={:.0} y={:.0}",
+                pick.center.x, pick.center.y,
+            );
+            println!("[RESULT] intent=\"{}\" method=\"structure_rule:zoom\"", intent.label);
+            println!("--- MATCH DEBUG END ---");
+            return Some(MatchResult { element: pick, score: 0.95 });
+        }
+        println!("[STRUCTURE] zoom rule: no pair found, falling through");
+    }
+
+    // ── Step 4: Fallback scoring (cursor dominance removed) ──
+    println!("[STRUCTURE] no structural rule matched, using fallback scoring");
+
     let max_distance = ((map.screenshot_width as f64).powi(2)
         + (map.screenshot_height as f64).powi(2))
     .sqrt()
     .max(1.0);
 
-    let label_lower = intent.label.to_lowercase();
-    let is_close_intent = label_lower.contains("close");
-
-    println!("Cursor pos: {:?}", cursor_pos);
+    // For toolbar/icon intents, restrict candidates to the top strip.
+    let is_toolbar_intent = is_top_strip_intent(&label_lower);
+    let candidates: Vec<&UiElement> = if is_toolbar_intent {
+        let filtered: Vec<&UiElement> = map.elements.iter().filter(|e| e.center.y < TOP_STRIP_Y).collect();
+        if !filtered.is_empty() {
+            println!("[FILTER] top-strip filter: {} → {} candidates", map.elements.len(), filtered.len());
+            filtered
+        } else {
+            map.elements.iter().collect()
+        }
+    } else {
+        map.elements.iter().collect()
+    };
 
     let mut best_score = 0.0f32;
     let mut best_element: Option<UiElement> = None;
 
-    for (i, el) in map.elements.iter().enumerate() {
-        // Reject only degenerate blobs (< 6px in either dimension).
-        // Browser icons are 16–36px — the old 20×20 floor was deleting correct elements.
-        if el.width < 6.0 || el.height < 6.0 {
-            println!(
-                "Candidate {}: REJECTED (degenerate {:.0}×{:.0})",
-                i, el.width, el.height
-            );
+    for (i, el) in candidates.iter().enumerate() {
+        if el.width < 4.0 || el.height < 4.0 {
             continue;
         }
 
         let mut score = 0.0f32;
-
-        println!(
-            "Candidate {}: x={:.0} y={:.0} size={:.0}x{:.0}",
-            i, el.center.x, el.center.y, el.width, el.height
-        );
 
         // text_similarity — 0.0 in Phase 1 (no OCR labels).
         let text_sim = el
@@ -235,8 +308,6 @@ pub fn match_intent(
         score += text_sim;
 
         // region_hint_match: +0.50 if the element centre is in the hinted region.
-        // Increased from 0.40 → 0.50 so a correct region alone is close to the
-        // gate, letting size_weight or cursor_bias push it over the threshold.
         let region_score = if let Some(ref hint) = intent.region_hint {
             if is_in_region(el.center.x, el.center.y, map.screenshot_width, map.screenshot_height, hint) {
                 score += 0.50;
@@ -249,7 +320,6 @@ pub fn match_intent(
         };
 
         // size_weight: prefer elements whose height falls in interactive size ranges.
-        // 24–80px = typical buttons; 12–24px = icons; 80–120px = still plausible.
         let h = el.height as f32;
         let size_w = if h >= 24.0 && h <= 80.0 {
             0.20
@@ -257,8 +327,8 @@ pub fn match_intent(
             0.18
         } else if h > 80.0 && h <= 120.0 {
             0.10
-        } else if h >= 6.0 && h < 12.0 {
-            0.08
+        } else if h >= 4.0 && h < 12.0 {
+            0.12
         } else {
             0.0
         };
@@ -274,55 +344,48 @@ pub fn match_intent(
             0.0f32
         };
 
-        // cursor_bias: continuous gradient — closer to cursor = higher bonus (max 0.45).
-        // Increased from 0.40 → 0.45 to give proximity more weight when OCR is absent.
+        // cursor_bias: CAPPED at 0.15 — cursor proximity must never dominate
+        // selection when all candidates lack text labels.
         let cursor_score = if let Some(cp) = cursor_pos {
             let distance = dist_sq(el.center.x, el.center.y, cp.x, cp.y).sqrt();
-            let s = (1.0 - distance / max_distance) as f32 * 0.45;
+            let s = (1.0 - distance / max_distance) as f32 * 0.15;
             score += s;
             s
         } else {
             0.0f32
         };
 
-        // close-button boost: when the intent is to close something, prefer elements
-        // in the top-right corner (where × buttons conventionally live).
-        let close_score = if is_close_intent {
-            let rel_x = el.center.x / map.screenshot_width as f64;
-            let rel_y_close = el.center.y / map.screenshot_height as f64;
-            // Top-right quadrant: x > 0.70, y < 0.20
-            if rel_x > 0.70 && rel_y_close < 0.20 {
-                score += 0.30;
-                0.30f32
-            } else {
-                0.0f32
-            }
+        // row-membership boost: elements that belong to a multi-element row
+        // are more likely to be real interactive UI than isolated blobs.
+        let row_score = if rows.iter().any(|row| row.len() >= 3 && row.iter().any(|r| std::ptr::eq(*r, *el))) {
+            score += 0.10;
+            0.10f32
         } else {
             0.0f32
         };
 
-        println!(
-            "  Scores → text: {:.2}, region: {:.2}, size: {:.2}, position: {:.2}, cursor: {:.2}, close: {:.2}, total: {:.2}",
-            text_sim, region_score, size_w, position_score, cursor_score, close_score, score
-        );
+        if i < 10 || score > best_score {
+            println!(
+                "  Candidate {}: x={:.0} y={:.0} size={:.0}x{:.0} → text:{:.2} region:{:.2} size:{:.2} pos:{:.2} cursor:{:.2} row:{:.2} total:{:.2}",
+                i, el.center.x, el.center.y, el.width, el.height,
+                text_sim, region_score, size_w, position_score, cursor_score, row_score, score,
+            );
+        }
 
         if score > best_score {
             best_score = score;
-            best_element = Some(el.clone());
+            best_element = Some((*el).clone());
         }
     }
 
     println!("Best score: {:.2} (threshold: {:.2})", best_score, MATCH_CONFIDENCE_THRESHOLD);
 
-    // Hard gate: below threshold.
-    // Soft gate: if the region_hint matched (score ≥ 0.50) but we're just
-    // barely under threshold (≥ 0.55), accept anyway — region correctness is a
-    // strong signal that the element is genuine.
     let has_region_hint = intent.region_hint.is_some();
     let soft_accept = has_region_hint && best_score >= 0.55;
 
     if best_score < MATCH_CONFIDENCE_THRESHOLD && !soft_accept {
-        println!("Rejected due to low confidence (< threshold{})", if soft_accept { " — overridden by soft accept" } else { "" });
+        println!("Rejected due to low confidence");
+        println!("[RESULT] intent=\"{}\" method=\"fallback_scoring\" result=REJECTED", intent.label);
         println!("--- MATCH DEBUG END ---");
         return None;
     }
@@ -331,8 +394,122 @@ pub fn match_intent(
         println!("Soft-accepted: region_hint matched and score={:.2} >= 0.55", best_score);
     }
 
+    println!("[RESULT] intent=\"{}\" method=\"fallback_scoring\" result=ACCEPTED", intent.label);
     println!("--- MATCH DEBUG END ---");
     best_element.map(|element| MatchResult { element, score: best_score })
+}
+
+// ─── Structural layout analysis ──────────────────────────────────────────────
+
+/// Groups elements into horizontal rows.  Two elements share a row when their
+/// y-centres are within `ROW_MERGE_TOLERANCE` pixels.
+fn group_by_rows<'a>(elements: &'a [UiElement]) -> Vec<Vec<&'a UiElement>> {
+    let mut rows: Vec<Vec<&UiElement>> = Vec::new();
+
+    for el in elements {
+        let mut placed = false;
+        for row in &mut rows {
+            if (row[0].center.y - el.center.y).abs() < ROW_MERGE_TOLERANCE {
+                row.push(el);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            rows.push(vec![el]);
+        }
+    }
+
+    // Sort each row left-to-right by x-centre.
+    for row in &mut rows {
+        row.sort_by(|a, b| a.center.x.partial_cmp(&b.center.x).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    rows
+}
+
+/// A tab/toolbar row: ≥ MIN_TAB_ROW_LEN elements all in the top strip.
+fn is_tab_row(row: &[&UiElement]) -> bool {
+    row.len() >= MIN_TAB_ROW_LEN && row.iter().all(|e| e.center.y < TOP_STRIP_Y)
+}
+
+/// Intent classification: "new tab"
+fn is_new_tab_intent(label: &str) -> bool {
+    label.contains("new tab")
+        || label.contains("add tab")
+        || (label.contains("tab") && label.contains('+'))
+        || label == "+"
+}
+
+/// Intent classification: "close" / "close tab"
+fn is_close_intent(label: &str) -> bool {
+    label.contains("close")
+}
+
+/// Intent classification: "zoom in" / "zoom out"
+fn is_zoom_intent(label: &str) -> bool {
+    label.contains("zoom")
+        || (label.contains("magnif"))
+}
+
+/// Returns true for intents that are typically in the top toolbar strip:
+/// tabs, navigation, address bar, window controls.
+fn is_top_strip_intent(label: &str) -> bool {
+    label.contains("tab")
+        || label.contains("address")
+        || label.contains("url")
+        || label.contains("reload")
+        || label.contains("refresh")
+        || label.contains("back")
+        || label.contains("forward")
+        || label.contains("minimize")
+        || label.contains("maximize")
+        || label.contains("close")
+}
+
+/// Find the element closest to the top-right corner of the screen.
+fn find_top_right_element<'a>(elements: &'a [UiElement], screen_w: u32, _screen_h: u32) -> Option<&'a UiElement> {
+    elements
+        .iter()
+        .filter(|e| {
+            let rel_x = e.center.x / screen_w as f64;
+            rel_x > 0.70 && e.center.y < TOP_STRIP_Y
+        })
+        .max_by(|a, b| {
+            a.center.x.partial_cmp(&b.center.x).unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+/// Find a zoom pair: two elements close together, similar y, similar area.
+/// Returns (left, right) sorted by x.
+fn find_zoom_pair(elements: &[&UiElement]) -> Option<(UiElement, UiElement)> {
+    let mut best: Option<(UiElement, UiElement)> = None;
+    let mut best_dist = f64::MAX;
+
+    for (i, a) in elements.iter().enumerate() {
+        for b in elements.iter().skip(i + 1) {
+            let dx = (a.center.x - b.center.x).abs();
+            let dy = (a.center.y - b.center.y).abs();
+            let a_area = a.width * a.height;
+            let b_area = b.width * b.height;
+            let area_diff = (a_area - b_area).abs();
+
+            if dx < 50.0 && dy < 12.0 && area_diff < 30.0 {
+                let d = dx + dy;
+                if d < best_dist {
+                    best_dist = d;
+                    let (left, right) = if a.center.x < b.center.x {
+                        ((*a).clone(), (*b).clone())
+                    } else {
+                        ((*b).clone(), (*a).clone())
+                    };
+                    best = Some((left, right));
+                }
+            }
+        }
+    }
+
+    best
 }
 
 /// Snaps a raw coordinate to the nearest `UiElement` centre within `radius` pixels.
