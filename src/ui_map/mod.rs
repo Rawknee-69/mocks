@@ -5,21 +5,26 @@
 /// `ElementIntent` against the map and returns the best candidate, or `None` when
 /// confidence is below the mandatory threshold (triggers Computer Use fallback).
 ///
+/// All element coordinates are stored in SCREENSHOT pixel space (PointS).
+/// Callers must use `CaptureDescriptor` + `screenshot_to_logical` to convert to
+/// logical desktop space before any further processing.
+///
 /// No external crates beyond `image` (already in Cargo.toml with `jpeg` feature) are
 /// required for this module.
+use crate::core::coords::PointS;
 use clicky_types::ElementIntent;
 use image::{GrayImage, Luma, RgbaImage};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
 /// A single detected interactive UI element.
+/// All coordinates are in SCREENSHOT pixel space (PointS).
 #[derive(Debug, Clone)]
 pub struct UiElement {
     /// From OCR or heuristic; `None` in Phase 1 (no OCR crate).
     pub label: Option<String>,
     /// Center of the element's bounding box in screenshot pixel space.
-    pub center_x: f64,
-    pub center_y: f64,
+    pub center: PointS,
     pub width: f64,
     pub height: f64,
 }
@@ -134,8 +139,10 @@ pub fn build_ui_map(jpeg_bytes: &[u8]) -> Result<UiMap, UiMapError> {
             }
             Some(UiElement {
                 label: None,
-                center_x: bb.x as f64 + bb.width as f64 / 2.0,
-                center_y: bb.y as f64 + bb.height as f64 / 2.0,
+                center: PointS {
+                    x: bb.x as f64 + bb.width as f64 / 2.0,
+                    y: bb.y as f64 + bb.height as f64 / 2.0,
+                },
                 width: bb.width as f64,
                 height: bb.height as f64,
             })
@@ -147,7 +154,7 @@ pub fn build_ui_map(jpeg_bytes: &[u8]) -> Result<UiMap, UiMapError> {
     for (i, el) in elements.iter().enumerate().take(10) {
         println!(
             "Element {}: x={:.0} y={:.0} w={:.0} h={:.0}",
-            i, el.center_x, el.center_y, el.width, el.height
+            i, el.center.x, el.center.y, el.width, el.height
         );
     }
     if elements.len() > 10 {
@@ -174,7 +181,7 @@ pub fn build_ui_map(jpeg_bytes: &[u8]) -> Result<UiMap, UiMapError> {
 pub fn match_intent(
     map: &UiMap,
     intent: &ElementIntent,
-    cursor_pos: Option<(f64, f64)>,
+    cursor_pos: Option<PointS>,
 ) -> Option<MatchResult> {
     println!("--- MATCH DEBUG START ---");
     println!("Intent: {:?}", intent);
@@ -215,7 +222,7 @@ pub fn match_intent(
 
         println!(
             "Candidate {}: x={:.0} y={:.0} size={:.0}x{:.0}",
-            i, el.center_x, el.center_y, el.width, el.height
+            i, el.center.x, el.center.y, el.width, el.height
         );
 
         // text_similarity — 0.0 in Phase 1 (no OCR labels).
@@ -230,7 +237,7 @@ pub fn match_intent(
         // Increased from 0.40 → 0.50 so a correct region alone is close to the
         // gate, letting size_weight or cursor_bias push it over the threshold.
         let region_score = if let Some(ref hint) = intent.region_hint {
-            if is_in_region(el.center_x, el.center_y, map.screenshot_width, map.screenshot_height, hint) {
+            if is_in_region(el.center.x, el.center.y, map.screenshot_width, map.screenshot_height, hint) {
                 score += 0.50;
                 0.50f32
             } else {
@@ -252,7 +259,7 @@ pub fn match_intent(
         score += size_w;
 
         // position_bias: prefer elements in the vertical centre ±30% of the viewport.
-        let rel_y = el.center_y / map.screenshot_height as f64;
+        let rel_y = el.center.y / map.screenshot_height as f64;
         let in_action_zone = rel_y >= 0.20 && rel_y <= 0.80;
         let position_score = if in_action_zone {
             score += 0.15;
@@ -263,8 +270,8 @@ pub fn match_intent(
 
         // cursor_bias: continuous gradient — closer to cursor = higher bonus (max 0.45).
         // Increased from 0.40 → 0.45 to give proximity more weight when OCR is absent.
-        let cursor_score = if let Some((cx, cy)) = cursor_pos {
-            let distance = dist_sq(el.center_x, el.center_y, cx, cy).sqrt();
+        let cursor_score = if let Some(cp) = cursor_pos {
+            let distance = dist_sq(el.center.x, el.center.y, cp.x, cp.y).sqrt();
             let s = (1.0 - distance / max_distance) as f32 * 0.45;
             score += s;
             s
@@ -275,8 +282,8 @@ pub fn match_intent(
         // close-button boost: when the intent is to close something, prefer elements
         // in the top-right corner (where × buttons conventionally live).
         let close_score = if is_close_intent {
-            let rel_x = el.center_x / map.screenshot_width as f64;
-            let rel_y_close = el.center_y / map.screenshot_height as f64;
+            let rel_x = el.center.x / map.screenshot_width as f64;
+            let rel_y_close = el.center.y / map.screenshot_height as f64;
             // Top-right quadrant: x > 0.70, y < 0.20
             if rel_x > 0.70 && rel_y_close < 0.20 {
                 score += 0.30;
@@ -324,6 +331,8 @@ pub fn match_intent(
 
 /// Snaps a raw coordinate to the nearest `UiElement` centre within `radius` pixels.
 ///
+/// Input and output are in SCREENSHOT pixel space (PointS).
+///
 /// Selection rule:
 /// 1. Candidates = elements whose centre is within `radius` of `coord`.
 /// 2. No candidates → `None` (safe fail).
@@ -331,18 +340,17 @@ pub fn match_intent(
 /// 4. Multiple → the element with the highest `area × proximity_score`,
 ///    where `proximity_score = 1.0 − (distance / radius)`.
 pub fn snap_to_nearest_ui_element(
-    coord: (f64, f64),
+    coord: PointS,
     map: &UiMap,
     radius: f64,
-) -> Option<(f64, f64)> {
-    let (cx, cy) = coord;
+) -> Option<PointS> {
     let radius_sq = radius * radius;
 
     let candidates: Vec<(&UiElement, f64)> = map
         .elements
         .iter()
         .filter_map(|el| {
-            let d2 = dist_sq(el.center_x, el.center_y, cx, cy);
+            let d2 = dist_sq(el.center.x, el.center.y, coord.x, coord.y);
             if d2 <= radius_sq {
                 Some((el, d2.sqrt()))
             } else {
@@ -353,7 +361,7 @@ pub fn snap_to_nearest_ui_element(
 
     match candidates.len() {
         0 => None,
-        1 => Some((candidates[0].0.center_x, candidates[0].0.center_y)),
+        1 => Some(candidates[0].0.center),
         _ => {
             let best = candidates.iter().max_by(|(a_el, a_dist), (b_el, b_dist)| {
                 let a_area = a_el.width * a_el.height;
@@ -364,7 +372,7 @@ pub fn snap_to_nearest_ui_element(
                 let b_score = b_area * b_prox;
                 a_score.partial_cmp(&b_score).unwrap_or(std::cmp::Ordering::Equal)
             })?;
-            Some((best.0.center_x, best.0.center_y))
+            Some(best.0.center)
         }
     }
 }
@@ -373,12 +381,13 @@ pub fn snap_to_nearest_ui_element(
 ///
 /// Used in final safety validation — a coordinate with no nearby edges is likely
 /// a hallucinated centre point rather than a real UI element boundary.
+/// `coord` must be in SCREENSHOT pixel space (PointS).
 pub fn no_edge_pixels_nearby(
-    coord: (f64, f64),
+    coord: PointS,
     edge_mask: &GrayImage,
     radius: u32,
 ) -> bool {
-    let (cx, cy) = (coord.0 as i64, coord.1 as i64);
+    let (cx, cy) = (coord.x as i64, coord.y as i64);
     let (width, height) = edge_mask.dimensions();
     let r = radius as i64;
 
@@ -401,11 +410,12 @@ pub fn no_edge_pixels_nearby(
 }
 
 /// Returns `true` when no `UiElement` bounding box centre is within `radius` of `coord`.
-pub fn no_bounding_box_nearby(coord: (f64, f64), map: &UiMap, radius: f64) -> bool {
+/// `coord` must be in SCREENSHOT pixel space (PointS).
+pub fn no_bounding_box_nearby(coord: PointS, map: &UiMap, radius: f64) -> bool {
     let radius_sq = radius * radius;
     !map.elements
         .iter()
-        .any(|el| dist_sq(el.center_x, el.center_y, coord.0, coord.1) <= radius_sq)
+        .any(|el| dist_sq(el.center.x, el.center.y, coord.x, coord.y) <= radius_sq)
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────

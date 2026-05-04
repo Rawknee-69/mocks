@@ -6,12 +6,10 @@
 /// The previous connection's tasks are not explicitly cancelled but will fail
 /// when they try to send on the closed channel.
 use crate::api::{self, computer_use, openrouter, Provider};
-use crate::core::context_compactor;
 use crate::error::AppError;
 use crate::handlers::{llm_pipeline, transcription};
 use clicky_types::{ClientMessage, DisplayInfo, ScreenshotData, ServerMessage};
 use futures_util::{SinkExt, StreamExt};
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -54,7 +52,7 @@ pub async fn run(port: u16) {
         openrouter_api_key.clone(),
         llm_model,
         openrouter::DEFAULT_OPENROUTER_MODEL,
-        "gemini-2.0-flash",
+        "gemini-3-flash-preview",
     ));
 
     let cu_provider: Arc<Provider> = Arc::new(build_provider(
@@ -63,7 +61,7 @@ pub async fn run(port: u16) {
         openrouter_api_key.clone(),
         cu_model,
         computer_use::DEFAULT_CU_MODEL,
-        "gemini-2.0-flash",
+        "gemini-3-flash-preview",
     ));
 
     // Fail fast with a clear message rather than silently using an empty key.
@@ -155,7 +153,7 @@ async fn handle_connection(
 
     let mut active_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
     let mut audio_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>> = None;
-    let mut conversation_history: VecDeque<(String, String)> = VecDeque::new();
+    let mut conversation_history: Vec<(String, String)> = Vec::new();
     let mut last_transcript: Option<String> = None;
     let mut cursor_position: (f32, f32) = (0.0, 0.0);
     // Screenshots are retained across turns so RequestCUCoordinate can use them later.
@@ -261,9 +259,6 @@ async fn handle_connection(
                     } else {
                         info!("final transcript: '{}' — launching LLM pipeline", transcript);
 
-                        // context_compactor can make HTTP calls; run it in a spawned task
-                        // so it never blocks the select loop from processing new WS messages
-                        // or pipeline events while the compactor awaits a network response.
                         let config = llm_pipeline::LlmPipelineConfig {
                             llm_provider: Arc::clone(&llm_provider),
                             deepgram_api_key: deepgram_key.clone(),
@@ -273,30 +268,21 @@ async fn handle_connection(
                         };
                         let client = Arc::clone(&http_client);
                         let tx = pipeline_tx.clone();
-                        let history: Vec<(String, String)> =
-                            conversation_history.iter().cloned().collect();
+                        // Stateless context: pass empty history so each request is
+                        // fully determined by the current transcript + screenshot only.
+                        // This eliminates non-determinism from stale conversation state
+                        // and prevents context pollution from prior turns.
+                        let history: Vec<(String, String)> = Vec::new();
                         let (screenshots, display_infos) =
                             last_screenshots.clone().unwrap_or_default();
-                        let compact_provider = Arc::clone(&llm_provider);
-                        let compact_rl = Arc::clone(&llm_rate_limiter);
                         tokio::spawn(async move {
-                            // Compactor runs inside the spawned task — never blocks the loop.
-                            let mut history_mut = history.iter().cloned().collect::<VecDeque<_>>();
-                            context_compactor::maybe_compact(
-                                &mut history_mut,
-                                &client,
-                                &compact_provider,
-                                compact_rl,
-                            )
-                            .await;
-                            let compacted: Vec<(String, String)> = history_mut.into_iter().collect();
                             llm_pipeline::run_llm_pipeline(
                                 (*client).clone(),
                                 config,
                                 transcript,
                                 screenshots,
                                 display_infos,
-                                compacted,
+                                history,
                                 tx,
                             )
                             .await;
@@ -304,14 +290,13 @@ async fn handle_connection(
                     }
                 }
 
-                // Track PipelineReady to update conversation history
+                // Track PipelineReady to update conversation history (kept for future use)
                 if let ServerMessage::PipelineReady { ref spoken_text, .. } = message {
                     if let Some(ref transcript) = last_transcript {
-                        conversation_history
-                            .push_back((transcript.clone(), spoken_text.clone()));
-                        // Keep last 10 exchanges (compactor handles token pressure)
+                        conversation_history.push((transcript.clone(), spoken_text.clone()));
+                        // Keep last 10 exchanges
                         if conversation_history.len() > 10 {
-                            conversation_history.pop_front();
+                            conversation_history.remove(0);
                         }
                     }
                 }
@@ -472,12 +457,34 @@ async fn handle_client_message(
                 )
                 .await;
 
-                let coordinate = result.map(|coord| {
+                let coordinate = result.and_then(|coord| {
                     let gx = origin_x + coord.display_local_x;
                     let gy = origin_y + coord.display_local_y;
                     info!("[CU] detection result: local=({:.1},{:.1}) global=({gx:.1},{gy:.1})",
                         coord.display_local_x, coord.display_local_y);
-                    (gx, gy)
+
+                    // Backend-side screen-centre hallucination guard:
+                    // Reject if the result is within 3% of the display centre.
+                    let cx = origin_x + display_w / 2.0;
+                    let cy = origin_y + display_h / 2.0;
+                    let threshold = display_w.min(display_h) * 0.03;
+                    let dx = gx - cx;
+                    let dy = gy - cy;
+                    if (dx * dx + dy * dy).sqrt() < threshold {
+                        warn!("[CU] ({gx:.0},{gy:.0}) matches screen centre ({cx:.0},{cy:.0}) — rejecting hallucination");
+                        return None;
+                    }
+
+                    // Reject coordinates outside display bounds.
+                    if gx < origin_x || gy < origin_y
+                        || gx > origin_x + display_w
+                        || gy > origin_y + display_h
+                    {
+                        warn!("[CU] ({gx:.0},{gy:.0}) outside display bounds — rejecting");
+                        return None;
+                    }
+
+                    Some((gx, gy))
                 });
 
                 if coordinate.is_none() {

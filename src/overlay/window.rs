@@ -19,6 +19,9 @@ use crate::audio::playback::AudioPlayer;
 use crate::audio::UiEvent;
 use crate::config::AppConfig;
 use crate::core::audio_rms::AudioPowerLevelTracker;
+use crate::core::coords::{
+    self, CaptureDescriptor, PointL, PointS,
+};
 use crate::cursor_tracker::CursorTracker;
 use crate::hotkey::PushToTalkTransition;
 use crate::overlay::gpu::Renderer;
@@ -798,16 +801,16 @@ impl OverlayApp {
                     if ax.is_finite() && ay.is_finite() && ax >= 0.0 && ay >= 0.0
                         && ax < self.screen_w as f64 && ay < self.screen_h as f64
                     {
-                        Some((ax, ay))
+                        Some(PointL { x: ax, y: ay })
                     } else {
                         None
                     }
                 });
 
-                if let Some((gx, gy)) = adjusted_coord {
+                if let Some(coord) = adjusted_coord {
                     self.render_state.start_flight_to(
-                        gx - self.overlay_x as f64,
-                        gy - self.overlay_y as f64,
+                        coord.x - self.overlay_x as f64,
+                        coord.y - self.overlay_y as f64,
                         spoken_text.clone(),
                     );
                 }
@@ -868,7 +871,7 @@ impl OverlayApp {
                         let cursor_pos_ss = self.screenshot_space_cursor(cursor_ss_index, &display_infos);
                         let match_result = crate::ui_map::match_intent(ui_map, &intent, cursor_pos_ss);
 
-                        println!("UI MAP RESULT: {:?}", match_result.as_ref().map(|m| (m.score, m.element.center_x, m.element.center_y)));
+                        println!("UI MAP RESULT: {:?}", match_result.as_ref().map(|m| (m.score, m.element.center.x, m.element.center.y)));
 
                         if let Some(ref m) = match_result {
                             println!("Best match score: {:.3}", m.score);
@@ -880,18 +883,18 @@ impl OverlayApp {
                             // Confidence gate already enforced inside match_intent.
                             log::info!(
                                 "UI-map match: '{}' score={:.2} at ss=({:.0},{:.0})",
-                                intent.label, m.score, m.element.center_x, m.element.center_y
+                                intent.label, m.score, m.element.center.x, m.element.center.y
                             );
-                            if let Some(global_coord) = self.map_element_to_global(&m.element, cursor_ss_index, &display_infos) {
-                                if self.is_valid_coordinate(global_coord, &display_infos) {
+                            if let Some(global_coord) = self.map_element_to_logical(&m.element, cursor_ss_index, &display_infos) {
+                                if self.is_valid_logical_coordinate(global_coord, &display_infos) {
                                     log::info!(
-                                        "[FINAL PIPELINE] ui-map ss=({:.0},{:.0}) → global=({:.0},{:.0}) label='{}'",
-                                        m.element.center_x, m.element.center_y,
-                                        global_coord.0, global_coord.1,
+                                        "[FINAL PIPELINE] ui-map ss=({:.0},{:.0}) → logical=({:.0},{:.0}) label='{}'",
+                                        m.element.center.x, m.element.center.y,
+                                        global_coord.x, global_coord.y,
                                         intent.label,
                                     );
-                                    println!("FINAL COORDINATE USED: x={:.0} y={:.0}", global_coord.0, global_coord.1);
-                                    self.start_flight_global(global_coord, &spoken_text);
+                                    println!("FINAL COORDINATE USED: x={:.0} y={:.0}", global_coord.x, global_coord.y);
+                                    self.start_flight_logical(global_coord, &spoken_text);
                                     self.cu_coordinate_pending = false;
                                     self.cu_pending_since = None;
                                     return;
@@ -936,86 +939,76 @@ impl OverlayApp {
                 self.cu_pending_since = None;
                 log::info!("[CU] cu_coordinate_pending cleared");
 
-                let raw_coord = if let Some((raw_cx, raw_cy)) = coordinate {
-                    (raw_cx, raw_cy)
+                let raw_logical = if let Some((raw_cx, raw_cy)) = coordinate {
+                    PointL { x: raw_cx, y: raw_cy }
                 } else {
                     // CU found no element — use last-resort fallback (current cursor position).
                     println!("All detection paths failed — using fallback");
                     log::warn!("CU found no element — using current cursor position as last-resort fallback");
                     let pos = self.cursor_tracker.get_position();
                     let lbl = self.pending_intent.as_ref().map(|i| i.label.clone()).unwrap_or_default();
-                    self.start_flight_global((pos.0 as f64, pos.1 as f64), &lbl);
+                    self.start_flight_logical(PointL { x: pos.0 as f64, y: pos.1 as f64 }, &lbl);
                     return;
                 };
 
-                let (raw_cx, raw_cy) = raw_coord;
-                println!("CU raw coordinate: {:?}", (raw_cx, raw_cy));
+                println!("CU raw coordinate: ({:.0},{:.0})", raw_logical.x, raw_logical.y);
 
-                // Snap raw CU coordinate to nearest UI element.
+                // Snap raw CU coordinate (logical) to nearest UI element.
                 // On snap failure, fall back to the raw CU coordinate rather than silently doing nothing.
-                let snapped = if let Some(ui_map) = &self.last_ui_map {
-                    // CU coordinate is already in global display space.  Convert to
-                    // screenshot-pixel space for snap_to_nearest_ui_element.
+                let snapped_logical = if let Some(ui_map) = &self.last_ui_map {
                     let display_infos = self.last_display_infos.as_deref().unwrap_or(&[]);
-                    let ss_coord = self.global_to_screenshot_space((raw_cx, raw_cy), display_infos);
-                    if let Some(ss) = ss_coord {
+                    let cap = self.make_capture_descriptor_for_cursor(display_infos);
+                    if let Some(cap) = cap {
+                        // Convert logical → screenshot space for snapping, then back.
+                        let ss_coord = coords::logical_to_screenshot(raw_logical, &cap);
                         log::info!(
                             "[SNAP] CU raw=({:.0},{:.0}) → ss=({:.0},{:.0}) radius={}px",
-                            raw_cx, raw_cy, ss.0, ss.1, SNAP_RADIUS_PX as u32
+                            raw_logical.x, raw_logical.y, ss_coord.x, ss_coord.y, SNAP_RADIUS_PX as u32
                         );
-                        if let Some(snapped_ss) = snap_to_nearest_ui_element(ss, ui_map, SNAP_RADIUS_PX) {
+                        if let Some(snapped_ss) = snap_to_nearest_ui_element(ss_coord, ui_map, SNAP_RADIUS_PX) {
+                            let snapped = coords::screenshot_to_logical(snapped_ss, &cap);
                             log::info!(
-                                "[SNAP] snapped ss=({:.0},{:.0}) → ss_snapped=({:.0},{:.0}) Δ=({:.1},{:.1})",
-                                ss.0, ss.1, snapped_ss.0, snapped_ss.1,
-                                snapped_ss.0 - ss.0, snapped_ss.1 - ss.1,
+                                "[SNAP] snapped ss=({:.0},{:.0}) → logical=({:.0},{:.0}) Δ=({:.1},{:.1})",
+                                ss_coord.x, ss_coord.y, snapped.x, snapped.y,
+                                snapped.x - raw_logical.x, snapped.y - raw_logical.y,
                             );
-                            println!("Snapped coordinate: {:?}", snapped_ss);
-                            // Convert snapped screenshot-space back to global.
-                            let display_infos_vec: Vec<DisplayInfo> = display_infos.to_vec();
-                            let cursor_idx = display_infos_vec.iter().position(|d| d.is_cursor_display).unwrap_or(0);
-                            let element = crate::ui_map::UiElement {
-                                label: None,
-                                center_x: snapped_ss.0,
-                                center_y: snapped_ss.1,
-                                width: 1.0,
-                                height: 1.0,
-                            };
-                            self.map_element_to_global(&element, cursor_idx, &display_infos_vec)
-                                .unwrap_or((raw_cx, raw_cy))
+                            println!("Snapped coordinate: ({:.0},{:.0})", snapped.x, snapped.y);
+                            snapped
                         } else {
                             // No UI element within snap radius — use raw CU coordinate.
                             log::info!(
                                 "[SNAP] no UI element within {}px of ss=({:.0},{:.0}) — using raw CU coordinate",
-                                SNAP_RADIUS_PX as u32, ss.0, ss.1
+                                SNAP_RADIUS_PX as u32, ss_coord.x, ss_coord.y
                             );
                             println!("No nearby UI element for CU coordinate (snap radius {}px)", SNAP_RADIUS_PX);
-                            log::warn!("CU snap: no UI element within {}px — using raw CU coordinate", SNAP_RADIUS_PX);
-                            (raw_cx, raw_cy)
+                            raw_logical
                         }
                     } else {
-                        // Can't convert to screenshot space — use raw coordinate.
-                        log::warn!("[SNAP] global_to_screenshot_space failed for ({:.0},{:.0}) — using raw", raw_cx, raw_cy);
-                        (raw_cx, raw_cy)
+                        log::warn!("[SNAP] could not build CaptureDescriptor — using raw coordinate");
+                        raw_logical
                     }
                 } else {
-                    log::warn!("[SNAP] no UI map available — using raw CU coordinate ({:.0},{:.0})", raw_cx, raw_cy);
-                    (raw_cx, raw_cy)
+                    log::warn!("[SNAP] no UI map available — using raw CU coordinate ({:.0},{:.0})", raw_logical.x, raw_logical.y);
+                    raw_logical
                 };
 
                 // Apply drift compensation using the freshest cursor position.
                 let current = self.cursor_tracker.get_position();
                 let drift_x = (current.0 - self.mouse_pos_at_release.0) as f64;
                 let drift_y = (current.1 - self.mouse_pos_at_release.1) as f64;
-                let drifted = (snapped.0 + drift_x, snapped.1 + drift_y);
+                let drifted = PointL {
+                    x: snapped_logical.x + drift_x,
+                    y: snapped_logical.y + drift_y,
+                };
 
                 let display_infos_vec = self.last_display_infos.clone().unwrap_or_default();
                 if display_infos_vec.is_empty() {
                     log::warn!("[CU] last_display_infos is empty during CUCoordinateReady — coordinate mapping will use (0,0) origin");
                 }
-                let final_coord = if self.is_valid_coordinate(drifted, &display_infos_vec) {
+                let final_coord = if self.is_valid_logical_coordinate(drifted, &display_infos_vec) {
                     log::info!(
                         "[CU] coordinate passed validation: snapped=({:.0},{:.0}) drift=({:.1},{:.1}) final=({:.0},{:.0})",
-                        snapped.0, snapped.1, drift_x, drift_y, drifted.0, drifted.1
+                        snapped_logical.x, snapped_logical.y, drift_x, drift_y, drifted.x, drifted.y
                     );
                     drifted
                 } else {
@@ -1023,23 +1016,33 @@ impl OverlayApp {
                     // than falling back to cursor position, which would completely miss the target.
                     log::warn!(
                         "[CU] drifted coordinate ({:.0},{:.0}) failed validation — using snapped ({:.0},{:.0}) without drift",
-                        drifted.0, drifted.1, snapped.0, snapped.1
+                        drifted.x, drifted.y, snapped_logical.x, snapped_logical.y
                     );
-                    snapped
+                    snapped_logical
                 };
 
                 // Use the speech bubble text that was set when PipelineReadyWithIntent arrived.
                 let label = self.pending_intent.as_ref().map(|i| i.label.clone()).unwrap_or_default();
                 log::info!(
                     "[FINAL PIPELINE] raw=({:.0},{:.0}) → snapped=({:.0},{:.0}) → drifted=({:.0},{:.0}) → cursor=({:.0},{:.0}) label='{}'",
-                    raw_cx, raw_cy,
-                    snapped.0, snapped.1,
-                    drifted.0, drifted.1,
-                    final_coord.0, final_coord.1,
+                    raw_logical.x, raw_logical.y,
+                    snapped_logical.x, snapped_logical.y,
+                    drifted.x, drifted.y,
+                    final_coord.x, final_coord.y,
                     label,
                 );
-                println!("FINAL COORDINATE USED: x={:.0} y={:.0}", final_coord.0, final_coord.1);
-                self.start_flight_global(final_coord, &label);
+                // Emit full pipeline trace.
+                coords::log_pipeline(
+                    None,
+                    None,
+                    Some(raw_logical),
+                    Some(snapped_logical),
+                    Some(final_coord),
+                    None,
+                    None,
+                );
+                println!("FINAL COORDINATE USED: x={:.0} y={:.0}", final_coord.x, final_coord.y);
+                self.start_flight_logical(final_coord, &label);
             }
             UiEvent::TtsError(err) => {
                 log::warn!("TTS error (legacy): {err}");
@@ -1076,106 +1079,90 @@ impl OverlayApp {
         }
     }
 
-    /// Starts the bezier flight animation to a global display coordinate.
-    fn start_flight_global(&mut self, global: (f64, f64), spoken_text: &str) {
-        let local_x = global.0 - self.overlay_x as f64;
-        let local_y = global.1 - self.overlay_y as f64;
+    /// Starts the bezier flight animation to a logical desktop coordinate.
+    ///
+    /// On Windows also physically moves the OS cursor to the target using
+    /// `spawn_blocking` so it never blocks the 60fps render loop.
+    fn start_flight_logical(&mut self, logical: PointL, spoken_text: &str) {
+        let local_x = logical.x - self.overlay_x as f64;
+        let local_y = logical.y - self.overlay_y as f64;
         log::info!(
-            "[FINAL PIPELINE] global=({:.0},{:.0}) overlay_origin=({},{}) → local=({:.0},{:.0}) label='{}'",
-            global.0, global.1,
+            "[FINAL PIPELINE] logical=({:.0},{:.0}) overlay_origin=({},{}) → local=({:.0},{:.0}) label='{}'",
+            logical.x, logical.y,
             self.overlay_x, self.overlay_y,
             local_x, local_y,
             spoken_text
         );
         self.render_state.start_flight_to(local_x, local_y, spoken_text.to_owned());
+
+        // Physically move the OS cursor to the target (Windows only).
+        // Runs in spawn_blocking so it never stalls the render loop.
+        // Uses SetCursorPos with the LOGICAL coordinate — Windows handles DPI
+        // automatically when the process is Per-Monitor V2 DPI-aware.
+        #[cfg(target_os = "windows")]
+        {
+            let target_x = logical.x as i32;
+            let target_y = logical.y as i32;
+            self.tokio_rt.spawn_blocking(move || {
+                execute_cursor_move_with_retry(target_x, target_y);
+            });
+        }
     }
 
-    /// Maps a `UiElement` (in screenshot-pixel space) to global display coordinates.
+    /// Maps a `UiElement` (in SCREENSHOT pixel space) to LOGICAL desktop coordinates.
     ///
-    /// Single-source transform (no double-scaling):
-    ///   norm_x  = center_x / screenshot_width_pixels          (0..1)
-    ///   norm_y  = center_y / screenshot_height_pixels         (0..1)
+    /// Transform (exact, single application):
+    ///   norm_x  = center.x / screenshot_width_pixels          (0..1)
+    ///   norm_y  = center.y / screenshot_height_pixels         (0..1)
     ///   local_x = norm_x * display_width_points               (logical pts on this display)
     ///   local_y = norm_y * display_height_points
-    ///   global  = (origin_x + local_x, origin_y + local_y)   (global physical px)
-    fn map_element_to_global(
+    ///   global  = (origin_x + local_x, origin_y + local_y)   (global logical desktop)
+    fn map_element_to_logical(
         &self,
         element: &crate::ui_map::UiElement,
         screenshot_index: usize,
         display_infos: &[DisplayInfo],
-    ) -> Option<(f64, f64)> {
+    ) -> Option<PointL> {
         let display = display_infos.get(screenshot_index)?;
-        let ss_w = display.screenshot_width_pixels as f64;
-        let ss_h = display.screenshot_height_pixels as f64;
-        if ss_w <= 0.0 || ss_h <= 0.0 {
+        let cap = CaptureDescriptor::from_display_info(display, 1.0);
+        if cap.bitmap_width == 0 || cap.bitmap_height == 0 {
             log::warn!("[MAP] display[{}] screenshot dims are zero — cannot map", screenshot_index);
             return None;
         }
-        if display.display_width_points <= 0.0 || display.display_height_points <= 0.0 {
+        if cap.logical_rect.width <= 0.0 || cap.logical_rect.height <= 0.0 {
             log::warn!("[MAP] display[{}] logical size is zero — DPI info missing", screenshot_index);
             return None;
         }
-        let norm_x = element.center_x / ss_w;
-        let norm_y = element.center_y / ss_h;
-        let local_x = norm_x * display.display_width_points;
-        let local_y = norm_y * display.display_height_points;
-        let global_x = display.global_origin_x + local_x;
-        let global_y = display.global_origin_y + local_y;
+        let result = coords::screenshot_to_logical(element.center, &cap);
         log::info!(
-            "[MAP] ss=({:.0},{:.0}) ss_size={}x{} → norm=({:.4},{:.4}) → local=({:.0},{:.0}) → global=({:.0},{:.0})",
-            element.center_x, element.center_y,
-            ss_w as u32, ss_h as u32,
-            norm_x, norm_y,
-            local_x, local_y,
-            global_x, global_y,
+            "[MAP] ss=({:.0},{:.0}) ss_size={}x{} → logical=({:.0},{:.0})",
+            element.center.x, element.center.y,
+            cap.bitmap_width, cap.bitmap_height,
+            result.x, result.y,
         );
-        Some((global_x, global_y))
+        Some(result)
     }
 
-    /// Converts a global display coordinate back to screenshot-pixel space on the cursor's display.
-    fn global_to_screenshot_space(
-        &self,
-        global: (f64, f64),
-        display_infos: &[DisplayInfo],
-    ) -> Option<(f64, f64)> {
+    /// Builds a `CaptureDescriptor` for the cursor's current display.
+    fn make_capture_descriptor_for_cursor(&self, display_infos: &[DisplayInfo]) -> Option<CaptureDescriptor> {
         let display = display_infos.iter().find(|d| d.is_cursor_display)?;
-        let local_x = global.0 - display.global_origin_x;
-        let local_y = global.1 - display.global_origin_y;
-        let ss_w = display.screenshot_width_pixels as f64;
-        let ss_h = display.screenshot_height_pixels as f64;
-        if display.display_width_points <= 0.0 || display.display_height_points <= 0.0 {
-            log::warn!("[MAP] global_to_ss: logical display size is zero — DPI info missing");
-            return None;
-        }
-        let ss_x = local_x / display.display_width_points * ss_w;
-        let ss_y = local_y / display.display_height_points * ss_h;
-        log::debug!(
-            "[MAP] global=({:.0},{:.0}) → local=({:.0},{:.0}) → ss=({:.0},{:.0}) (scale {:.3}x{:.3})",
-            global.0, global.1, local_x, local_y, ss_x, ss_y,
-            ss_w / display.display_width_points,
-            ss_h / display.display_height_points,
-        );
-        Some((ss_x, ss_y))
+        Some(CaptureDescriptor::from_display_info(display, 1.0))
     }
 
-    /// Returns the cursor position in the screenshot-pixel space of the given display.
+    /// Returns the cursor position in SCREENSHOT pixel space on the given display.
     fn screenshot_space_cursor(
         &self,
         screenshot_index: usize,
         display_infos: &[DisplayInfo],
-    ) -> Option<(f64, f64)> {
+    ) -> Option<PointS> {
         let display = display_infos.get(screenshot_index)?;
-        let cursor = self.cursor_tracker.get_position();
-        let local_x = cursor.0 as f64 - display.global_origin_x;
-        let local_y = cursor.1 as f64 - display.global_origin_y;
-        let ss_w = display.screenshot_width_pixels as f64;
-        let ss_h = display.screenshot_height_pixels as f64;
-        if display.display_width_points <= 0.0 || display.display_height_points <= 0.0 {
+        let cap = CaptureDescriptor::from_display_info(display, 1.0);
+        if cap.logical_rect.width <= 0.0 || cap.logical_rect.height <= 0.0 {
             return None;
         }
-        let ss_x = local_x / display.display_width_points * ss_w;
-        let ss_y = local_y / display.display_height_points * ss_h;
-        Some((ss_x, ss_y))
+        let cursor = self.cursor_tracker.get_position();
+        let logical = PointL { x: cursor.0 as f64, y: cursor.1 as f64 };
+        Some(coords::logical_to_screenshot(logical, &cap))
     }
 
     /// Safety validation gate — rejects coordinates that are likely hallucinated or unsafe.
@@ -1190,45 +1177,53 @@ impl OverlayApp {
     /// NOTE: guards 3 & 4 are skipped when `last_ui_map` is absent. A missing map means
     /// the Sobel processing hasn't finished yet — it is not safe to reject on absent data,
     /// since the CU coordinate is the result of a real model inference.
-    fn is_valid_coordinate(&self, coord: (f64, f64), display_infos: &[DisplayInfo]) -> bool {
-        if !coord.0.is_finite() || !coord.1.is_finite() {
-            log::warn!("[COORD-VALIDATE] ({:.0},{:.0}) is not finite — rejecting", coord.0, coord.1);
+    fn is_valid_logical_coordinate(&self, coord: PointL, display_infos: &[DisplayInfo]) -> bool {
+        if !coord.x.is_finite() || !coord.y.is_finite() {
+            log::warn!("[COORD-VALIDATE] ({:.0},{:.0}) is not finite — rejecting", coord.x, coord.y);
             return false;
         }
 
+        // Build CaptureDescriptors for hallucination check.
+        let caps: Vec<CaptureDescriptor> = display_infos
+            .iter()
+            .map(|d| CaptureDescriptor::from_display_info(d, 1.0))
+            .collect();
+
         // Guard 2: screen-centre hallucination.
-        // 3% threshold (was 2%) — catches models that report near-centre rather than exact centre.
-        for d in display_infos {
-            let cx = d.global_origin_x + d.display_width_points / 2.0;
-            let cy = d.global_origin_y + d.display_height_points / 2.0;
-            let dx = coord.0 - cx;
-            let dy = coord.1 - cy;
-            let threshold = d.display_width_points.min(d.display_height_points) * 0.03;
-            if (dx * dx + dy * dy).sqrt() < threshold {
-                log::warn!(
-                    "[COORD-VALIDATE] ({:.0},{:.0}) matches screen centre ({:.0},{:.0}) within {:.0}px — rejecting hallucination",
-                    coord.0, coord.1, cx, cy, threshold
-                );
-                return false;
-            }
+        if coords::is_screen_centre_hallucination(coord, &caps) {
+            log::warn!(
+                "[COORD-VALIDATE] ({:.0},{:.0}) matches screen centre — rejecting hallucination",
+                coord.x, coord.y
+            );
+            return false;
+        }
+
+        // Guard 1b: outside all display bounds.
+        if !caps.is_empty() && !coords::is_within_any_display(coord, &caps) {
+            log::warn!(
+                "[COORD-VALIDATE] ({:.0},{:.0}) is outside all display bounds — rejecting",
+                coord.x, coord.y
+            );
+            return false;
         }
 
         // Guards 3 & 4 require the UI map. Skip entirely when absent — never reject
         // a good CU coordinate because the UI map hasn't been built yet.
         if let Some(ui_map) = &self.last_ui_map {
-            let ss_coord = self.global_to_screenshot_space(coord, display_infos.as_ref());
-            if let Some(ss) = ss_coord {
+            let cap = self.make_capture_descriptor_for_cursor(display_infos);
+            if let Some(cap) = cap {
+                let ss = coords::logical_to_screenshot(coord, &cap);
                 if crate::ui_map::no_edge_pixels_nearby(ss, &ui_map.edge_mask, 15) {
                     log::warn!(
                         "[COORD-VALIDATE] ({:.0},{:.0}) → ss({:.0},{:.0}): no edge pixels within 15px — rejecting",
-                        coord.0, coord.1, ss.0, ss.1
+                        coord.x, coord.y, ss.x, ss.y
                     );
                     return false;
                 }
                 if crate::ui_map::no_bounding_box_nearby(ss, ui_map, 20.0) {
                     log::warn!(
                         "[COORD-VALIDATE] ({:.0},{:.0}) → ss({:.0},{:.0}): no UI element within 20px — rejecting",
-                        coord.0, coord.1, ss.0, ss.1
+                        coord.x, coord.y, ss.x, ss.y
                     );
                     return false;
                 }
@@ -1236,11 +1231,63 @@ impl OverlayApp {
         } else {
             log::info!(
                 "[COORD-VALIDATE] ({:.0},{:.0}): no UI map yet — skipping edge/bbox guards",
-                coord.0, coord.1
+                coord.x, coord.y
             );
         }
 
-        log::info!("[COORD-VALIDATE] ({:.0},{:.0}) passed all guards", coord.0, coord.1);
+        log::info!("[COORD-VALIDATE] ({:.0},{:.0}) passed all guards", coord.x, coord.y);
         true
     }
+}
+
+// ─── Windows cursor execution (freeze-safe) ───────────────────────────────────
+
+/// Moves the OS cursor to `(x, y)` in logical desktop space on Windows.
+///
+/// Design notes:
+/// - Called from `spawn_blocking` — never runs on the render thread.
+/// - `SetCursorPos` takes LOGICAL coordinates when the process is
+///   `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` (set in `main()`).
+/// - If the cursor did not actually move (another process pinned it), we retry
+///   twice with a 300 ms gap before giving up — matching the spec requirement.
+#[cfg(target_os = "windows")]
+fn execute_cursor_move_with_retry(x: i32, y: i32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+    use windows_sys::Win32::Foundation::POINT;
+
+    const MAX_RETRIES: u32 = 2;
+    const RETRY_DELAY_MS: u64 = 300;
+
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+        }
+
+        let ok = unsafe { SetCursorPos(x, y) };
+        if ok == 0 {
+            log::warn!("[CURSOR] SetCursorPos({x},{y}) failed on attempt {attempt}");
+            continue;
+        }
+
+        // Verify the cursor actually moved to within 2 pixels (tolerates DPI rounding).
+        let mut actual = POINT { x: 0, y: 0 };
+        let got = unsafe { GetCursorPos(&mut actual) };
+        if got != 0 {
+            let dx = (actual.x - x).abs();
+            let dy = (actual.y - y).abs();
+            if dx <= 2 && dy <= 2 {
+                log::info!(
+                    "[CURSOR] moved to ({x},{y}) on attempt {attempt} — actual=({},{})",
+                    actual.x, actual.y
+                );
+                return;
+            }
+            log::warn!(
+                "[CURSOR] SetCursorPos({x},{y}) attempt {attempt}: cursor at ({},{}) — Δ={dx},{dy} > 2px",
+                actual.x, actual.y
+            );
+        }
+    }
+
+    log::warn!("[CURSOR] SetCursorPos({x},{y}) did not converge after {MAX_RETRIES} retries — giving up");
 }

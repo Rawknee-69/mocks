@@ -51,6 +51,38 @@ pub struct ComputerUseCoordinate {
 
 // ─── Internal types ───────────────────────────────────────────────────────────
 
+/// Records the crop window used in pass-2 refinement so the offset is never lost.
+///
+/// After the model returns a coordinate in the CROPPED image's pixel space, we must
+/// add back the crop origin (in logical display points) before the result is valid.
+/// Storing this here makes that step impossible to omit.
+#[derive(Debug, Clone, Copy)]
+struct RefinementView {
+    /// Crop origin in display logical points.
+    logical_x: f64,
+    logical_y: f64,
+    /// Logical size of the crop window.
+    logical_w: f64,
+    logical_h: f64,
+    /// Bitmap dimensions the crop was resampled to.
+    bitmap_width: u32,
+    bitmap_height: u32,
+}
+
+impl RefinementView {
+    /// Reconstruct a logical display coordinate from a model pixel coordinate.
+    ///
+    /// Formula (exact, single application):
+    ///   x_L = crop_x + refined_x × (W_crop / W_bitmap)
+    ///   y_L = crop_y + refined_y × (H_crop / H_bitmap)
+    #[inline]
+    fn unproject(&self, model_x: f64, model_y: f64) -> (f64, f64) {
+        let lx = self.logical_x + model_x * (self.logical_w / self.bitmap_width as f64);
+        let ly = self.logical_y + model_y * (self.logical_h / self.bitmap_height as f64);
+        (lx, ly)
+    }
+}
+
 /// Pixel dimensions of the image that was sent to the model.
 /// A named struct makes it impossible to accidentally swap model-space and
 /// display-space when projecting coordinates back.
@@ -103,6 +135,18 @@ impl Crop {
         let local_x = mx / dims.width as f64 * self.w;
         let local_y = my / dims.height as f64 * self.h;
         (self.x + local_x, self.y + local_y)
+    }
+
+    /// Convert this crop to a `RefinementView` for the given model bitmap size.
+    fn to_refinement_view(&self, bitmap_width: u32, bitmap_height: u32) -> RefinementView {
+        RefinementView {
+            logical_x: self.x,
+            logical_y: self.y,
+            logical_w: self.w,
+            logical_h: self.h,
+            bitmap_width,
+            bitmap_height,
+        }
     }
 }
 
@@ -248,6 +292,11 @@ pub async fn detect_element_location(
         zoom_dims.width as f64 / crop.w,
     );
 
+    // Build RefinementView from the crop — this is the single source of truth
+    // for the pass-2 offset. The model returns pixels in the CROPPED image space;
+    // RefinementView::unproject adds back the crop origin to get display logical pts.
+    let refinement_view = crop.to_refinement_view(zoom_dims.width, zoom_dims.height);
+
     // Build the pass-2 prompt HERE with the raw user question.
     // The crop context is embedded in the prompt body — not in the question arg.
     let pass2_prompt = build_pass2_prompt(
@@ -273,8 +322,10 @@ pub async fn detect_element_location(
         Some((raw2_x, raw2_y)) => {
             let (raw2_x, raw2_y) = denormalise_if_needed(raw2_x, raw2_y, zoom_dims);
             let (mx2, my2) = clamp_to_dims(raw2_x, raw2_y, zoom_dims);
-            let (fine_dx, fine_dy) = crop.unproject_model(mx2, my2, zoom_dims);
-            info!("ComputerUse pass 2 → ({fine_dx:.1}, {fine_dy:.1}) display pts");
+            // Use RefinementView to add back the crop offset — NEVER skip this step.
+            let (fine_dx, fine_dy) = refinement_view.unproject(mx2, my2);
+            info!("ComputerUse pass 2 → ({fine_dx:.1}, {fine_dy:.1}) display pts (crop_origin=({:.1},{:.1}))",
+                refinement_view.logical_x, refinement_view.logical_y);
             (fine_dx, fine_dy)
         }
         None => {
@@ -1095,11 +1146,38 @@ mod tests {
     }
     #[test]
     fn crop_unproject_centre() {
-        let c = Crop { x: 100.0, y: 200.0, w: 400.0, h: 300.0 };
-        let dims = ModelDims { width: 800, height: 600 };
-        let (dx, dy) = c.unproject_model(400.0, 300.0, dims);
+        // Verify RefinementView correctly reconstructs the display-local coord.
+        // Crop at (100, 200), size 400x300, resampled to 800x600 bitmap.
+        // Model returns (400, 300) — the centre of the bitmap.
+        // Expected: (100 + 400*(400/800), 200 + 300*(300/600)) = (300, 350)
+        let rv = RefinementView {
+            logical_x: 100.0,
+            logical_y: 200.0,
+            logical_w: 400.0,
+            logical_h: 300.0,
+            bitmap_width: 800,
+            bitmap_height: 600,
+        };
+        let (dx, dy) = rv.unproject(400.0, 300.0);
         assert!((dx - 300.0).abs() < 1.0, "dx={dx}");
         assert!((dy - 350.0).abs() < 1.0, "dy={dy}");
+    }
+
+    #[test]
+    fn crop_offset_never_lost() {
+        // Regression: if crop origin is non-zero, the offset must appear in the result.
+        let rv = RefinementView {
+            logical_x: 500.0,
+            logical_y: 800.0,
+            logical_w: 480.0,
+            logical_h: 270.0,
+            bitmap_width: 1920,
+            bitmap_height: 1080,
+        };
+        // Model returns (0, 0) → must map to crop origin (500, 800), not (0, 0).
+        let (dx, dy) = rv.unproject(0.0, 0.0);
+        assert!((dx - 500.0).abs() < 1.0, "origin_x not preserved: dx={dx}");
+        assert!((dy - 800.0).abs() < 1.0, "origin_y not preserved: dy={dy}");
     }
 
     // ── Parsing ────────────────────────────────────────────────────────────
