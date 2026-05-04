@@ -26,7 +26,9 @@ use crate::cursor_tracker::CursorTracker;
 use crate::hotkey::PushToTalkTransition;
 use crate::overlay::gpu::Renderer;
 use crate::overlay::renderer::{CursorNavigationMode, OverlayRenderState};
+use crate::screen_model::ScreenModel;
 use crate::tray::TrayMenuEvent;
+use crate::uia::UIElement;
 use crate::ui_map::{snap_to_nearest_ui_element, UiMap, SNAP_RADIUS_PX};
 use clicky_types::{ClientMessage, DisplayInfo, ElementIntent, ScreenshotData};
 
@@ -80,6 +82,10 @@ pub struct OverlayApp {
     pub last_display_infos: Option<Vec<DisplayInfo>>,
     // UI map built from the most recent screenshots.
     pub last_ui_map: Option<UiMap>,
+    // UIA elements extracted from the desktop (Windows only).
+    pub last_uia_elements: Vec<UIElement>,
+    // Merged screen model (UIA + vision).
+    pub last_screen_model: Option<ScreenModel>,
     // Pending intent waiting for a CUCoordinateReady reply.
     pub pending_intent: Option<ElementIntent>,
     // Channel used by the screenshot task to deliver a local copy to the render loop.
@@ -344,13 +350,34 @@ impl ApplicationHandler for OverlayApp {
                             map.screenshot_width,
                             map.screenshot_height
                         );
+                        crate::pipeline_log::log_vision(
+                            map.elements.len(),
+                            &map.elements.iter().take(10).map(|el| {
+                                (el.center.x, el.center.y, el.width, el.height)
+                            }).collect::<Vec<_>>(),
+                        );
                         self.last_ui_map = Some(map);
+                        self.rebuild_screen_model();
                     }
                     Err(e) => log::warn!("UI map build failed: {e}"),
                 }
             }
             self.last_screenshots = Some(screenshots);
-            self.last_display_infos = Some(display_infos);
+            self.last_display_infos = Some(display_infos.clone());
+            for (i, d) in display_infos.iter().enumerate() {
+                crate::pipeline_log::log_screen(
+                    i,
+                    d.display_width_points,
+                    d.display_height_points,
+                    d.global_origin_x,
+                    d.global_origin_y,
+                    if d.display_width_points > 0.0 {
+                        d.screenshot_width_pixels as f64 / d.display_width_points
+                    } else {
+                        1.0
+                    },
+                );
+            }
         }
 
         // Processing timeout — always 30s regardless of pipeline state.
@@ -709,6 +736,20 @@ impl OverlayApp {
                     self.last_screenshots = None;
                     self.last_display_infos = None;
                     self.pending_intent = None;
+                    self.last_uia_elements = Vec::new();
+                    self.last_screen_model = None;
+
+                    // Fire UIA tree extraction in background (Windows only).
+                    #[cfg(target_os = "windows")]
+                    {
+                        let uia_event_tx = self.api_adapter.ui_event_tx_clone();
+                        self.tokio_rt.spawn_blocking(move || {
+                            let start = std::time::Instant::now();
+                            let elements = crate::uia::extract_ui_tree();
+                            log::info!("[UIA] extraction took {:.0}ms — {} elements", start.elapsed().as_millis(), elements.len());
+                            let _ = uia_event_tx.send(UiEvent::UIATreeReady(elements));
+                        });
+                    }
 
                     let local_tx = self.screenshot_local_tx.clone();
                     let handle = self.tokio_rt.spawn_blocking(move || {
@@ -855,8 +896,13 @@ impl OverlayApp {
                     crate::core::bubble_text::pick_bubble_phrase(intent.is_some());
 
                 if let Some(intent) = intent {
+                    crate::pipeline_log::log_model_output(
+                        Some(&intent.label),
+                        intent.region_hint.as_deref(),
+                        None,
+                    );
+
                     // Determine which display (screenshot index) to use for CU fallback.
-                    // Default to the cursor display index, or 0 if unknown.
                     let screenshot_index = display_infos
                         .iter()
                         .position(|d| d.is_cursor_display)
@@ -864,53 +910,105 @@ impl OverlayApp {
 
                     let cursor_ss_index = screenshot_index;
 
-                    // Try local UI-map match now.
-                    // If no map is built yet (race condition), immediately fire CU fallback.
+                    // ── UIA-first decision logic ──
+                    // Rebuild ScreenModel with latest data before trying UIA match.
+                    self.rebuild_screen_model();
+                    if let Some(ref screen_model) = self.last_screen_model {
+                        if let Some((uia_coord, match_desc)) = screen_model.try_uia_match(
+                            &intent.label,
+                            &intent.action,
+                            intent.region_hint.as_deref(),
+                            self.screen_w as f64,
+                            self.screen_h as f64,
+                        ) {
+                            log::info!("[UIA-MATCH] {} → ({:.0},{:.0})", match_desc, uia_coord.x, uia_coord.y);
+                            crate::pipeline_log::log_decision("UIA", &intent.label, &match_desc);
+
+                            // Use enhanced snap (UIA priority).
+                            let snapped = crate::screen_model::enhanced_snap(
+                                uia_coord,
+                                screen_model,
+                                100.0,
+                                SNAP_RADIUS_PX,
+                                self.last_ui_map.as_ref(),
+                                screen_model.capture.as_ref(),
+                            ).unwrap_or(uia_coord);
+                            crate::pipeline_log::log_snap("UIA", uia_coord, Some(snapped), 100.0);
+
+                            // UIA coordinates come from the OS accessibility tree — they are
+                            // authoritative. Only reject if outside display bounds or non-finite.
+                            if self.is_valid_bounds_only(snapped, &display_infos) {
+                                crate::pipeline_log::log_validate(snapped, true, "UIA path (trusted)");
+                                log::info!(
+                                    "[FINAL PIPELINE] UIA → logical=({:.0},{:.0}) label='{}'",
+                                    snapped.x, snapped.y, intent.label,
+                                );
+                                self.start_flight_logical(snapped, &spoken_text);
+                                self.cu_coordinate_pending = false;
+                                self.cu_pending_since = None;
+                                return;
+                            } else {
+                                crate::pipeline_log::log_validate(snapped, false, "UIA path outside display bounds");
+                                log::warn!("[UIA-MATCH] coordinate ({:.0},{:.0}) outside bounds — falling through to vision", snapped.x, snapped.y);
+                            }
+                        } else {
+                            crate::pipeline_log::log_decision("UIA", &intent.label, "no match");
+                        }
+                    }
+
+                    // ── Vision fallback ──
                     if let Some(ui_map) = &self.last_ui_map {
-                        println!("UI elements count: {}", ui_map.elements.len());
                         let cursor_pos_ss = self.screenshot_space_cursor(cursor_ss_index, &display_infos);
                         let match_result = crate::ui_map::match_intent(ui_map, &intent, cursor_pos_ss);
 
-                        println!("UI MAP RESULT: {:?}", match_result.as_ref().map(|m| (m.score, m.element.center.x, m.element.center.y)));
-
-                        if let Some(ref m) = match_result {
-                            println!("Best match score: {:.3}", m.score);
-                        } else {
-                            println!("Best match score: below threshold — firing CU fallback");
-                        }
-
                         if let Some(m) = match_result {
-                            // Confidence gate already enforced inside match_intent.
                             log::info!(
                                 "UI-map match: '{}' score={:.2} at ss=({:.0},{:.0})",
                                 intent.label, m.score, m.element.center.x, m.element.center.y
                             );
+                            crate::pipeline_log::log_decision("VISION", &intent.label, &format!("score={:.2}", m.score));
                             if let Some(global_coord) = self.map_element_to_logical(&m.element, cursor_ss_index, &display_infos) {
-                                if self.is_valid_logical_coordinate(global_coord, &display_infos) {
+                                // Use enhanced snap if ScreenModel is available.
+                                let snapped = if let Some(ref sm) = self.last_screen_model {
+                                    crate::screen_model::enhanced_snap(
+                                        global_coord,
+                                        sm,
+                                        100.0,
+                                        SNAP_RADIUS_PX,
+                                        self.last_ui_map.as_ref(),
+                                        sm.capture.as_ref(),
+                                    ).unwrap_or(global_coord)
+                                } else {
+                                    global_coord
+                                };
+                                crate::pipeline_log::log_snap("VISION", global_coord, Some(snapped), SNAP_RADIUS_PX);
+
+                                if self.is_valid_logical_coordinate(snapped, &display_infos) {
+                                    crate::pipeline_log::log_validate(snapped, true, "vision path");
                                     log::info!(
-                                        "[FINAL PIPELINE] ui-map ss=({:.0},{:.0}) → logical=({:.0},{:.0}) label='{}'",
+                                        "[FINAL PIPELINE] vision ss=({:.0},{:.0}) → logical=({:.0},{:.0}) label='{}'",
                                         m.element.center.x, m.element.center.y,
-                                        global_coord.x, global_coord.y,
-                                        intent.label,
+                                        snapped.x, snapped.y, intent.label,
                                     );
-                                    println!("FINAL COORDINATE USED: x={:.0} y={:.0}", global_coord.x, global_coord.y);
-                                    self.start_flight_logical(global_coord, &spoken_text);
+                                    self.start_flight_logical(snapped, &spoken_text);
                                     self.cu_coordinate_pending = false;
                                     self.cu_pending_since = None;
                                     return;
+                                } else {
+                                    crate::pipeline_log::log_validate(snapped, false, "vision path failed validation");
                                 }
                             }
+                        } else {
+                            crate::pipeline_log::log_decision("VISION", &intent.label, "below threshold");
                         }
-                    } else {
-                        println!("UI elements count: 0 (no UI map built yet)");
                     }
 
-                    // UI-map match failed or no map yet — fire CU fallback.
+                    // ── CU fallback ──
                     log::info!(
                         "[CU-FALLBACK] UI-map miss for '{}' — firing RequestCUCoordinate (display_index={})",
                         intent.label, screenshot_index
                     );
-                    println!("UI MAP FAILED → triggering CU fallback");
+                    crate::pipeline_log::log_decision("CU-FALLBACK", &intent.label, &format!("display_index={}", screenshot_index));
                     log::info!("UI-map miss for '{}', requesting CU coordinate", intent.label);
                     self.pending_intent = Some(intent.clone());
                     self.api_adapter.send(ClientMessage::RequestCUCoordinate {
@@ -926,6 +1024,56 @@ impl OverlayApp {
                 }
 
                 let _ = display_infos;
+            }
+            UiEvent::UIATreeReady(elements) => {
+                log::info!("[UIA] received {} elements from extraction", elements.len());
+                crate::pipeline_log::log_uia(
+                    elements.len(),
+                    &elements.iter().take(10).map(|el| {
+                        (el.name.clone(), el.control_type.clone(), el.rect.x, el.rect.y, el.rect.width, el.rect.height)
+                    }).collect::<Vec<_>>(),
+                );
+
+                // Send element summaries to backend for LLM prompt enrichment.
+                // Only send interactive elements with meaningful names — skip
+                // empty names, single-character garbage, and non-interactive types.
+                let summaries: Vec<clicky_types::UIElementSummary> = elements.iter()
+                    .filter(|el| {
+                        if el.name.trim().is_empty() {
+                            return false;
+                        }
+                        if el.name.trim().len() <= 2
+                            && el.name.trim().chars().all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+                        {
+                            return false;
+                        }
+                        matches!(
+                            el.control_type.as_str(),
+                            "Button" | "CheckBox" | "ComboBox" | "Edit" | "Hyperlink"
+                            | "ListItem" | "Menu" | "MenuBar" | "MenuItem" | "RadioButton"
+                            | "Slider" | "Tab" | "TabItem" | "TreeItem" | "SplitButton"
+                        )
+                    })
+                    .take(50)
+                    .map(|el| {
+                        let region = rough_region_hint(el.rect.center(), self.screen_w as f64, self.screen_h as f64);
+                        clicky_types::UIElementSummary {
+                            name: el.name.clone(),
+                            control_type: el.control_type.clone(),
+                            region_hint: region,
+                            rect_x: el.rect.x,
+                            rect_y: el.rect.y,
+                            rect_w: el.rect.width,
+                            rect_h: el.rect.height,
+                        }
+                    })
+                    .collect();
+                if !summaries.is_empty() {
+                    self.api_adapter.send(ClientMessage::UIElementsSummary { elements: summaries });
+                }
+
+                self.last_uia_elements = elements;
+                self.rebuild_screen_model();
             }
             UiEvent::CUCoordinateReady { coordinate } => {
                 log::info!("[CU] CUCoordinateReady received: {:?}", coordinate);
@@ -1167,6 +1315,25 @@ impl OverlayApp {
 
     /// Safety validation gate — rejects coordinates that are likely hallucinated or unsafe.
     ///
+    /// Lightweight bounds-only validation for UIA-sourced coordinates.
+    ///
+    /// UIA coordinates are authoritative (from the OS accessibility tree), so we only
+    /// reject non-finite values and coordinates outside all display bounds.
+    /// No edge-pixel, bounding-box, or hallucination guards.
+    fn is_valid_bounds_only(&self, coord: PointL, display_infos: &[DisplayInfo]) -> bool {
+        if !coord.x.is_finite() || !coord.y.is_finite() {
+            return false;
+        }
+        let caps: Vec<CaptureDescriptor> = display_infos
+            .iter()
+            .map(|d| CaptureDescriptor::from_display_info(d, 1.0))
+            .collect();
+        if !caps.is_empty() && !coords::is_within_any_display(coord, &caps) {
+            return false;
+        }
+        true
+    }
+
     /// Rejects when:
     /// 1. The coordinate is not finite.
     /// 2. The coordinate matches the geometric screen centre of any display (hallucination guard).
@@ -1213,16 +1380,16 @@ impl OverlayApp {
             let cap = self.make_capture_descriptor_for_cursor(display_infos);
             if let Some(cap) = cap {
                 let ss = coords::logical_to_screenshot(coord, &cap);
-                if crate::ui_map::no_edge_pixels_nearby(ss, &ui_map.edge_mask, 15) {
+                if crate::ui_map::no_edge_pixels_nearby(ss, &ui_map.edge_mask, 25) {
                     log::warn!(
-                        "[COORD-VALIDATE] ({:.0},{:.0}) → ss({:.0},{:.0}): no edge pixels within 15px — rejecting",
+                        "[COORD-VALIDATE] ({:.0},{:.0}) → ss({:.0},{:.0}): no edge pixels within 25px — rejecting",
                         coord.x, coord.y, ss.x, ss.y
                     );
                     return false;
                 }
-                if crate::ui_map::no_bounding_box_nearby(ss, ui_map, 20.0) {
+                if crate::ui_map::no_bounding_box_nearby(ss, ui_map, 40.0) {
                     log::warn!(
-                        "[COORD-VALIDATE] ({:.0},{:.0}) → ss({:.0},{:.0}): no UI element within 20px — rejecting",
+                        "[COORD-VALIDATE] ({:.0},{:.0}) → ss({:.0},{:.0}): no UI element within 40px — rejecting",
                         coord.x, coord.y, ss.x, ss.y
                     );
                     return false;
@@ -1238,6 +1405,34 @@ impl OverlayApp {
         log::info!("[COORD-VALIDATE] ({:.0},{:.0}) passed all guards", coord.x, coord.y);
         true
     }
+
+    /// Rebuilds the merged ScreenModel from the latest UIA and vision data.
+    fn rebuild_screen_model(&mut self) {
+        let capture = self.last_display_infos.as_ref().and_then(|infos| {
+            infos.iter().find(|d| d.is_cursor_display)
+                .map(|d| CaptureDescriptor::from_display_info(d, 1.0))
+        });
+        self.last_screen_model = Some(ScreenModel::from_sources(
+            self.last_uia_elements.clone(),
+            self.last_ui_map.as_ref(),
+            capture,
+        ));
+    }
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Converts a logical coordinate to a rough region hint string.
+fn rough_region_hint(p: crate::core::coords::PointL, screen_w: f64, screen_h: f64) -> String {
+    let rel_x = if screen_w > 0.0 { p.x / screen_w } else { 0.5 };
+    let rel_y = if screen_h > 0.0 { p.y / screen_h } else { 0.5 };
+    let v = if rel_y < 0.33 { "top" } else if rel_y > 0.66 { "bottom" } else { "center" };
+    let h = if rel_x < 0.33 { "left" } else if rel_x > 0.66 { "right" } else { "center" };
+    if v == "center" && h == "center" {
+        "center".to_string()
+    } else {
+        format!("{v} {h}")
+    }
 }
 
 // ─── Windows cursor execution (freeze-safe) ───────────────────────────────────
@@ -1248,15 +1443,19 @@ impl OverlayApp {
 /// - Called from `spawn_blocking` — never runs on the render thread.
 /// - `SetCursorPos` takes LOGICAL coordinates when the process is
 ///   `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` (set in `main()`).
-/// - If the cursor did not actually move (another process pinned it), we retry
-///   twice with a 300 ms gap before giving up — matching the spec requirement.
+/// - Verification sleep reduced from 300ms to 50ms per the spec.
+/// - After SetCursorPos, sends a zero-delta mouse_event as a backup nudge.
+/// - Every attempt is logged to logs.txt via the pipeline logger.
 #[cfg(target_os = "windows")]
 fn execute_cursor_move_with_retry(x: i32, y: i32) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, SetCursorPos,
+    };
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{mouse_event, MOUSEEVENTF_MOVE};
     use windows_sys::Win32::Foundation::POINT;
 
     const MAX_RETRIES: u32 = 2;
-    const RETRY_DELAY_MS: u64 = 300;
+    const RETRY_DELAY_MS: u64 = 50;
 
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
@@ -1266,8 +1465,15 @@ fn execute_cursor_move_with_retry(x: i32, y: i32) {
         let ok = unsafe { SetCursorPos(x, y) };
         if ok == 0 {
             log::warn!("[CURSOR] SetCursorPos({x},{y}) failed on attempt {attempt}");
+            crate::pipeline_log::log_exec(x, y, 0, 0, attempt, "SET_FAILED");
             continue;
         }
+
+        // Backup nudge: zero-delta mouse_event to ensure the cursor position update
+        // is processed by the input queue even if another process is fighting for it.
+        unsafe { mouse_event(MOUSEEVENTF_MOVE, 0, 0, 0, 0); }
+
+        std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
 
         // Verify the cursor actually moved to within 2 pixels (tolerates DPI rounding).
         let mut actual = POINT { x: 0, y: 0 };
@@ -1280,14 +1486,17 @@ fn execute_cursor_move_with_retry(x: i32, y: i32) {
                     "[CURSOR] moved to ({x},{y}) on attempt {attempt} — actual=({},{})",
                     actual.x, actual.y
                 );
+                crate::pipeline_log::log_exec(x, y, actual.x, actual.y, attempt, "SUCCESS");
                 return;
             }
             log::warn!(
                 "[CURSOR] SetCursorPos({x},{y}) attempt {attempt}: cursor at ({},{}) — Δ={dx},{dy} > 2px",
                 actual.x, actual.y
             );
+            crate::pipeline_log::log_exec(x, y, actual.x, actual.y, attempt, "RETRY");
         }
     }
 
     log::warn!("[CURSOR] SetCursorPos({x},{y}) did not converge after {MAX_RETRIES} retries — giving up");
+    crate::pipeline_log::log_exec(x, y, 0, 0, MAX_RETRIES, "FAIL");
 }

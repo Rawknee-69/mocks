@@ -34,6 +34,7 @@ pub async fn run_llm_pipeline(
     screenshots: Vec<ScreenshotData>,
     display_infos: Vec<DisplayInfo>,
     history_exchanges: Vec<(String, String)>,
+    uia_summaries: Vec<clicky_types::UIElementSummary>,
     server_tx: mpsc::Sender<ServerMessage>,
 ) {
     if screenshots.is_empty() {
@@ -59,6 +60,20 @@ pub async fn run_llm_pipeline(
     for (user_text, assistant_text) in &history_exchanges {
         messages.push(serde_json::json!({"role": "user", "content": user_text}));
         messages.push(serde_json::json!({"role": "assistant", "content": assistant_text}));
+    }
+
+    // Prepend UIA element context as a user message so the LLM knows which named
+    // elements are visible on screen before seeing the transcript + screenshots.
+    if !uia_summaries.is_empty() {
+        let mut element_text = String::from("visible UI elements on screen (from accessibility tree):\n");
+        for el in uia_summaries.iter().take(30) {
+            element_text.push_str(&format!(
+                "- {} ({}) in {} region\n",
+                el.name, el.control_type, el.region_hint
+            ));
+        }
+        messages.push(serde_json::json!({"role": "user", "content": element_text}));
+        info!("[LLM] injected {} UIA element summaries into prompt", uia_summaries.len().min(30));
     }
 
     let user_content = match config.llm_provider.as_ref() {

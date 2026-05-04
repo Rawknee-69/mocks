@@ -13,6 +13,8 @@
 use crate::error::AppError;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, warn};
@@ -47,7 +49,7 @@ impl StreamingTranscriptionSession {
     /// Connects to Deepgram and starts background audio/transcript tasks.
     pub async fn start(api_key: &str) -> Result<Self, AppError> {
         let websocket_url = format!(
-            "{}?model=nova-3&encoding=linear16&sample_rate={}&channels={}&punctuate=true&interim_results=true",
+            "{}?model=nova-3&encoding=linear16&sample_rate={}&channels={}&punctuate=true&interim_results=true&utterance_end_ms=1500&endpointing=400&vad_events=true&smart_format=true",
             DEEPGRAM_WS_URL, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS,
         );
 
@@ -76,6 +78,8 @@ impl StreamingTranscriptionSession {
         let (audio_sender, mut audio_receiver) = mpsc::channel::<Vec<u8>>(64);
         let (transcript_sender, transcript_receiver) = mpsc::channel::<TranscriptUpdate>(32);
         let (control_sender, mut control_receiver) = mpsc::channel::<ControlMessage>(4);
+        let close_stream_sent = Arc::new(AtomicBool::new(false));
+        let close_stream_sent_reader = Arc::clone(&close_stream_sent);
 
         // Audio sender task: forwards PCM16 data and handles CloseStream signal
         tokio::spawn(async move {
@@ -104,6 +108,7 @@ impl StreamingTranscriptionSession {
                         match control_msg {
                             Some(ControlMessage::CloseStream) => {
                                 debug!("sending CloseStream to Deepgram");
+                                close_stream_sent.store(true, Ordering::Release);
                                 let close_msg = serde_json::json!({"type": "CloseStream"});
                                 if let Err(err) = websocket_writer
                                     .send(Message::Text(close_msg.to_string().into()))
@@ -130,6 +135,7 @@ impl StreamingTranscriptionSession {
             let mut has_delivered_final = false;
 
             while let Some(message_result) = websocket_reader.next().await {
+                let got_close = close_stream_sent_reader.load(Ordering::Acquire);
                 let message = match message_result {
                     Ok(msg) => msg,
                     Err(err) => {
@@ -152,8 +158,21 @@ impl StreamingTranscriptionSession {
                 // Check for metadata/info messages first
                 if let Ok(envelope) = serde_json::from_str::<MessageEnvelope>(&text) {
                     match envelope.message_type.as_deref() {
-                        Some("Metadata") | Some("SpeechStarted") | Some("UtteranceEnd") => {
+                        Some("Metadata") | Some("SpeechStarted") => {
                             debug!("Deepgram info message: {:?}", envelope.message_type);
+                            continue;
+                        }
+                        Some("UtteranceEnd") => {
+                            debug!("Deepgram UtteranceEnd — flushing accumulated finals");
+                            if got_close && !accumulated_finals.is_empty() {
+                                let full = accumulated_finals.join(" ");
+                                debug!("Deepgram emitting Final after UtteranceEnd: '{}'", &full[..full.len().min(100)]);
+                                has_delivered_final = true;
+                                let _ = transcript_sender_clone
+                                    .send(TranscriptUpdate::Final(full))
+                                    .await;
+                                break;
+                            }
                             continue;
                         }
                         Some("Error") => {
@@ -183,7 +202,13 @@ impl StreamingTranscriptionSession {
                     .map(|alt| alt.transcript)
                     .unwrap_or_default();
 
+                // Skip empty results — Deepgram sometimes sends speech_final=true with
+                // an empty transcript for silence segments. We must NOT treat these as
+                // the authoritative final result.
                 if transcript_text.is_empty() {
+                    if result.speech_final {
+                        debug!("Deepgram empty speech_final — ignoring (silence segment)");
+                    }
                     continue;
                 }
 
@@ -192,16 +217,24 @@ impl StreamingTranscriptionSession {
                     let full = accumulated_finals.join(" ");
 
                     if result.speech_final {
-                        // speech_final=true is a natural sentence boundary and is the
-                        // authoritative complete transcript for this utterance. Emit
-                        // Final immediately — don't wait for the WebSocket to close.
-                        // The transcription bridge is waiting on this signal.
-                        debug!("Deepgram speech_final — emitting Final");
-                        has_delivered_final = true;
+                        if got_close {
+                            // CloseStream was already sent and this is a real speech_final
+                            // with content — emit Final immediately.
+                            debug!("Deepgram speech_final after CloseStream — emitting Final");
+                            has_delivered_final = true;
+                            let _ = transcript_sender_clone
+                                .send(TranscriptUpdate::Final(full))
+                                .await;
+                            break;
+                        }
+                        // speech_final before CloseStream: this is a natural sentence boundary.
+                        // Don't break — the user might still be speaking. Instead, send a
+                        // Partial so the UI can show progress. The definitive Final will be
+                        // emitted after CloseStream + speech_final or when the WS closes.
+                        debug!("Deepgram speech_final — sending partial, waiting for more");
                         let _ = transcript_sender_clone
-                            .send(TranscriptUpdate::Final(full))
+                            .send(TranscriptUpdate::Partial(full))
                             .await;
-                        break;
                     } else {
                         let _ = transcript_sender_clone
                             .send(TranscriptUpdate::Partial(full))
@@ -222,11 +255,10 @@ impl StreamingTranscriptionSession {
 
             // When the WebSocket closes after CloseStream, emit the accumulated final
             if !has_delivered_final {
-                has_delivered_final = true;
                 let full = accumulated_finals.join(" ");
+                debug!("Deepgram WS closed — emitting accumulated Final: '{}'", &full[..full.len().min(100)]);
                 let _ = transcript_sender_clone.send(TranscriptUpdate::Final(full)).await;
             }
-            let _ = has_delivered_final; // suppress unused warning
         });
 
         Ok(Self {

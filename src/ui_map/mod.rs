@@ -65,12 +65,12 @@ impl std::fmt::Display for UiMapError {
 /// Sobel edge threshold.  Higher = fewer edges, fewer false-positive blobs.
 const EDGE_THRESHOLD: u8 = 30;
 /// Discard blobs smaller than this area (px²).
-const MIN_BLOB_AREA: u32 = 300;
+const MIN_BLOB_AREA: u32 = 50;
 /// Discard blobs larger than this area (px²).
 const MAX_BLOB_AREA: u32 = 200_000;
 /// Acceptable aspect ratio range: width / height.
-const MIN_ASPECT: f32 = 0.5;
-const MAX_ASPECT: f32 = 3.0;
+const MIN_ASPECT: f32 = 0.15;
+const MAX_ASPECT: f32 = 6.0;
 /// Mandatory minimum score for a match to be accepted.
 /// Lowered from 0.80 → 0.65: the region_hint + cursor_bias path can now
 /// satisfy the gate without requiring OCR text similarity.
@@ -709,4 +709,75 @@ fn dist_sq(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
     let dx = ax - bx;
     let dy = ay - by;
     dx * dx + dy * dy
+}
+
+/// Multi-pass vision refinement with crop reprojection.
+///
+/// 1. Takes a coarse match centre (in screenshot pixel space).
+/// 2. Crops a region of `crop_size` pixels around it.
+/// 3. Re-runs edge detection on the crop for finer detail.
+/// 4. Reprojects the refined centre back to full-screenshot space.
+///
+/// Returns `None` if the crop fails to produce any valid elements.
+pub fn refine_with_crop(
+    jpeg_bytes: &[u8],
+    coarse_center: PointS,
+    crop_size: u32,
+) -> Result<Option<PointS>, UiMapError> {
+    let img = image::load_from_memory(jpeg_bytes)
+        .map_err(|e| UiMapError::DecodeError(e.to_string()))?;
+    let rgba: RgbaImage = img.to_rgba8();
+    let (full_w, full_h) = rgba.dimensions();
+
+    let half = crop_size / 2;
+    let crop_x = (coarse_center.x as u32).saturating_sub(half).min(full_w.saturating_sub(crop_size));
+    let crop_y = (coarse_center.y as u32).saturating_sub(half).min(full_h.saturating_sub(crop_size));
+    let crop_w = crop_size.min(full_w - crop_x);
+    let crop_h = crop_size.min(full_h - crop_y);
+
+    if crop_w < 20 || crop_h < 20 {
+        return Ok(None);
+    }
+
+    let cropped = image::imageops::crop_imm(&rgba, crop_x, crop_y, crop_w, crop_h).to_image();
+    let gray = rgba_to_gray(&cropped);
+    let blurred = box_blur_3x3(&gray);
+    let edges = sobel_edge_magnitude(&blurred);
+    let bboxes = connected_components(&edges, EDGE_THRESHOLD);
+
+    let elements: Vec<(f64, f64, u32)> = bboxes
+        .into_iter()
+        .filter(|bb| {
+            let area = bb.area();
+            let aspect = bb.width as f32 / bb.height.max(1) as f32;
+            area >= 100 && area <= MAX_BLOB_AREA
+                && aspect >= MIN_ASPECT && aspect <= MAX_ASPECT
+        })
+        .map(|bb| {
+            let cx = bb.x as f64 + bb.width as f64 / 2.0;
+            let cy = bb.y as f64 + bb.height as f64 / 2.0;
+            let area = bb.area();
+            (cx, cy, area)
+        })
+        .collect();
+
+    if elements.is_empty() {
+        return Ok(None);
+    }
+
+    // Find the element closest to the crop centre.
+    let crop_cx = crop_w as f64 / 2.0;
+    let crop_cy = crop_h as f64 / 2.0;
+    let best = elements.iter().min_by(|a, b| {
+        let da = dist_sq(a.0, a.1, crop_cx, crop_cy);
+        let db = dist_sq(b.0, b.1, crop_cx, crop_cy);
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(best.map(|(cx, cy, _)| {
+        PointS {
+            x: crop_x as f64 + cx,
+            y: crop_y as f64 + cy,
+        }
+    }))
 }
