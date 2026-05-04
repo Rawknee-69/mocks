@@ -158,6 +158,8 @@ async fn handle_connection(
     let mut cursor_position: (f32, f32) = (0.0, 0.0);
     // Screenshots are retained across turns so RequestCUCoordinate can use them later.
     let mut last_screenshots: Option<(Vec<ScreenshotData>, Vec<DisplayInfo>)> = None;
+    // UIA element summaries from the frontend for LLM prompt enrichment.
+    let mut last_uia_summaries: Vec<clicky_types::UIElementSummary> = Vec::new();
 
     // Internal channel: pipeline tasks send ServerMessages here; this loop also
     // intercepts FinalTranscript to trigger the LLM pipeline.
@@ -219,6 +221,7 @@ async fn handle_connection(
                     &mut audio_tx,
                     &mut cursor_position,
                     &mut last_screenshots,
+                    &mut last_uia_summaries,
                     &deepgram_key,
                     &http_client,
                     pipeline_tx.clone(),
@@ -275,6 +278,7 @@ async fn handle_connection(
                         let history: Vec<(String, String)> = Vec::new();
                         let (screenshots, display_infos) =
                             last_screenshots.clone().unwrap_or_default();
+                        let uia_summaries = last_uia_summaries.clone();
                         tokio::spawn(async move {
                             llm_pipeline::run_llm_pipeline(
                                 (*client).clone(),
@@ -283,6 +287,7 @@ async fn handle_connection(
                                 screenshots,
                                 display_infos,
                                 history,
+                                uia_summaries,
                                 tx,
                             )
                             .await;
@@ -326,6 +331,7 @@ async fn handle_client_message(
     audio_tx: &mut Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     cursor_position: &mut (f32, f32),
     last_screenshots: &mut Option<(Vec<ScreenshotData>, Vec<DisplayInfo>)>,
+    last_uia_summaries: &mut Vec<clicky_types::UIElementSummary>,
     deepgram_key: &Option<String>,
     http_client: &Arc<reqwest::Client>,
     pipeline_tx: mpsc::Sender<ServerMessage>,
@@ -499,6 +505,11 @@ async fn handle_client_message(
                     warn!("[CU] failed to send CUCoordinate — frontend channel closed");
                 }
             });
+        }
+
+        ClientMessage::UIElementsSummary { elements } => {
+            info!("[UIA] received {} element summaries from frontend", elements.len());
+            *last_uia_summaries = elements;
         }
     }
 }

@@ -8,9 +8,12 @@ mod cursor_tracker;
 mod hotkey;
 mod overlay;
 mod panel;
+mod pipeline_log;
 mod platform;
+mod screen_model;
 mod screenshot;
 mod tray;
+mod uia;
 mod ui_map;
 
 use api::adapter::{ApiAdapter, BACKEND_PORT};
@@ -173,6 +176,8 @@ fn main() {
         last_screenshots: None,
         last_display_infos: None,
         last_ui_map: None,
+        last_uia_elements: Vec::new(),
+        last_screen_model: None,
         pending_intent: None,
         screenshot_local_tx,
         screenshot_local_rx,

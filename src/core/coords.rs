@@ -180,6 +180,14 @@ pub fn model_to_logical(p: PointM, cap: &CaptureDescriptor) -> PointL {
     screenshot_to_logical(model_to_screenshot(p, cap), cap)
 }
 
+/// Euclidean distance between two logical points.
+#[inline]
+pub fn distance(a: PointL, b: PointL) -> f64 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    (dx * dx + dy * dy).sqrt()
+}
+
 // ─── Validation helpers ───────────────────────────────────────────────────────
 
 /// Returns `true` if `p` falls within the bounds of any provided `CaptureDescriptor`.

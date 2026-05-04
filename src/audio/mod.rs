@@ -1,6 +1,7 @@
 pub mod capture;
 pub mod playback;
 
+use crate::uia::UIElement;
 use clicky_types::{DisplayInfo, ElementIntent};
 use std::fmt;
 
@@ -36,6 +37,8 @@ pub enum UiEvent {
     CUCoordinateReady {
         coordinate: Option<(f64, f64)>,
     },
+    /// UIA tree extraction completed (Windows only).
+    UIATreeReady(Vec<UIElement>),
     PipelineError(String),
     /// TTS synthesis failed — caller should fall back to espeak-ng.
     TtsError(String),

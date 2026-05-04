@@ -40,6 +40,12 @@ pub enum ClientMessage {
         /// Index into the screenshots array (from the last Screenshots message) to use for CU.
         screenshot_index: usize,
     },
+
+    /// UIA element summaries sent to the backend so the LLM prompt can include
+    /// element names and approximate regions for better intent output.
+    UIElementsSummary {
+        elements: Vec<UIElementSummary>,
+    },
 }
 
 /// Structured intent emitted by the LLM — describes WHAT to interact with, not WHERE.
@@ -184,4 +190,17 @@ pub enum ErrorCode {
 
     /// Generic server-side error not covered by the above.
     Internal,
+}
+
+/// Summary of a UI element detected via UIA or vision, sent to the backend
+/// to enrich the LLM prompt with element names and approximate regions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UIElementSummary {
+    pub name: String,
+    pub control_type: String,
+    pub region_hint: String,
+    pub rect_x: f64,
+    pub rect_y: f64,
+    pub rect_w: f64,
+    pub rect_h: f64,
 }

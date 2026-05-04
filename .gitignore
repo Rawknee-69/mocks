@@ -2,3 +2,4 @@
 .env
 clicky_llm_log.txt
 test_ss/
+logs.txt

@@ -22,6 +22,8 @@ pub struct ApiAdapter {
     client_tx: async_mpsc::Sender<ClientMessage>,
     /// Receive `UiEvent` values produced by the background WS task.
     ui_event_rx: std_mpsc::Receiver<UiEvent>,
+    /// Send `UiEvent` values directly from local tasks (e.g. UIA extraction).
+    ui_event_tx: std_mpsc::Sender<UiEvent>,
 }
 
 impl ApiAdapter {
@@ -33,9 +35,9 @@ impl ApiAdapter {
         let (client_tx, client_rx) = async_mpsc::channel::<ClientMessage>(128);
         let (ui_event_tx, ui_event_rx) = std_mpsc::channel::<UiEvent>();
 
-        tokio::spawn(ws_task(port, client_rx, ui_event_tx));
+        tokio::spawn(ws_task(port, client_rx, ui_event_tx.clone()));
 
-        Self { client_tx, ui_event_rx }
+        Self { client_tx, ui_event_rx, ui_event_tx }
     }
 
     /// Queues a `ClientMessage` for delivery to the backend (non-blocking).
@@ -48,6 +50,13 @@ impl ApiAdapter {
     /// (e.g. forwarding audio chunks from a blocking thread).
     pub fn client_tx_clone(&self) -> async_mpsc::Sender<ClientMessage> {
         self.client_tx.clone()
+    }
+
+    /// Returns a clone of the UiEvent sender for local background tasks
+    /// (e.g. UIA tree extraction) that need to post events to the render loop
+    /// without going through the backend WebSocket.
+    pub fn ui_event_tx_clone(&self) -> std_mpsc::Sender<UiEvent> {
+        self.ui_event_tx.clone()
     }
 
 
@@ -71,8 +80,8 @@ impl ApiAdapter {
         // Reuse the already-established connection rather than discarding it and opening a second one.
         let (client_tx, client_rx) = async_mpsc::channel::<ClientMessage>(128);
         let (ui_event_tx, ui_event_rx) = std_mpsc::channel::<UiEvent>();
-        tokio::spawn(ws_task_with_stream(ws_stream, port, client_rx, ui_event_tx));
-        Ok(Self { client_tx, ui_event_rx })
+        tokio::spawn(ws_task_with_stream(ws_stream, port, client_rx, ui_event_tx.clone()));
+        Ok(Self { client_tx, ui_event_rx, ui_event_tx })
     }
 
     /// Returns the next `UiEvent` if one is available, without blocking.
